@@ -1,0 +1,30 @@
+[package]
+name = "grpsqlite"
+description = "A SQLite VFS that stores databases on a gRPC server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# `static` registers the VFS from sqlite3_initialize in a SQLite build that
+# links this library; `dynamic` provides the loadable-extension entry point.
+static = ["sqlite-plugin/static"]
+dynamic = ["sqlite-plugin/dynamic"]
+
+[dependencies]
+bytes.workspace = true
+grpsqlite-proto.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+sqlite-plugin.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+xxhash-rust.workspace = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

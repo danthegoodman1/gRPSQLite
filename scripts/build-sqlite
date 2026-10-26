@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Builds two SQLite 3.54.1 shells from the official amalgamation:
+#
+#   target/sqlite/sqlite3-grpsqlite  the gRPSQLite VFS linked in and registered
+#                                    as the default through SQLITE_EXTRA_INIT
+#   target/sqlite/sqlite3            a stock shell, for `.load libgrpsqlite`
+#
+# and target/sqlite/libgrpsqlite.so, the loadable extension.
+#
+# Usage: scripts/build-sqlite [--debug]
+set -euo pipefail
+
+VERSION=3540100
+YEAR=2026
+SHA3=92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+profile=release
+cargo_profile=--release
+if [[ "${1:-}" == "--debug" ]]; then
+  profile=debug
+  cargo_profile=
+fi
+out="$root/target/sqlite"
+src="$out/sqlite-amalgamation-$VERSION"
+zip="$out/sqlite-amalgamation-$VERSION.zip"
+mkdir -p "$out"
+
+if [[ ! -f "$zip" ]]; then
+  curl -fsSL -o "$zip.part" "https://www.sqlite.org/$YEAR/sqlite-amalgamation-$VERSION.zip"
+  mv "$zip.part" "$zip"
+fi
+actual=$(openssl dgst -sha3-256 -r "$zip" | cut -d' ' -f1)
+if [[ "$actual" != "$SHA3" ]]; then
+  echo "SHA3-256 mismatch for $zip: got $actual, want $SHA3" >&2
+  exit 1
+fi
+rm -rf "$src"
+unzip -q "$zip" -d "$out"
+
+cflags=(
+  -O2
+  -DSQLITE_ENABLE_DBSTAT_VTAB
+  -DSQLITE_ENABLE_FTS5
+  -DSQLITE_ENABLE_MATH_FUNCTIONS
+  -DSQLITE_ENABLE_RTREE
+  -DHAVE_READLINE=0
+  -I"$src"
+)
+libs=(-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc)
+
+# The static library registers the VFS; link it into the shell.
+cargo build $cargo_profile -p grpsqlite --features static
+cc "${cflags[@]}" -DSQLITE_EXTRA_INIT=grpsqlite_extra_init \
+  "$src/shell.c" "$src/sqlite3.c" "$root/target/$profile/libgrpsqlite.a" "${libs[@]}" \
+  -o "$out/sqlite3-grpsqlite"
+
+# The loadable extension resolves SQLite through its API table, so it must
+# be built without the static registration code.
+cargo build $cargo_profile -p grpsqlite --features dynamic
+cp "$root/target/$profile/libgrpsqlite.so" "$out/libgrpsqlite.so"
+cc "${cflags[@]}" "$src/shell.c" "$src/sqlite3.c" -lpthread -ldl -lm -o "$out/sqlite3"
+
+echo "built $out/sqlite3-grpsqlite, $out/sqlite3 and $out/libgrpsqlite.so (SQLite $("$out/sqlite3" --version | cut -d' ' -f1))"

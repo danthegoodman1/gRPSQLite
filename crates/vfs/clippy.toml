@@ -1,0 +1,12 @@
+# A seed must replay the same run, so the VFS core reads no clocks, starts no
+# threads and iterates no unordered collections. `grpc.rs` is exempt.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is random; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is random; use BTreeSet" },
+    { path = "std::time::Instant", reason = "the core reads no clocks; ask the Backend" },
+    { path = "std::time::SystemTime", reason = "the core reads no clocks; ask the Backend" },
+]
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "the core starts no threads" },
+    { path = "std::thread::scope", reason = "the core starts no threads" },
+]

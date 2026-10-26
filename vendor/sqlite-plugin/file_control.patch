@@ -1,0 +1,35 @@
+--- a/src/vfs.rs	2006-07-23 18:21:28.000000000 -0700
++++ b/src/vfs.rs	2026-10-25 17:38:27.549414100 -0700
+@@ -178,6 +178,17 @@
+         Err(PragmaErr::NotFound)
+     }
+ 
++    /// Handle a file control opcode other than `SQLITE_FCNTL_PRAGMA`.
++    /// Return `Err(SQLITE_NOTFOUND)` for opcodes the VFS does not handle.
++    fn file_control(
++        &self,
++        handle: &mut Self::Handle,
++        op: c_int,
++        p_arg: *mut c_void,
++    ) -> VfsResult<()> {
++        Err(vars::SQLITE_NOTFOUND)
++    }
++
+     // system queries
+     fn sector_size(&self, handle: &mut Self::Handle) -> VfsResult<i32> {
+         Ok(DEFAULT_SECTOR_SIZE)
+@@ -706,7 +717,13 @@
+             result
+         });
+     }
+-    vars::SQLITE_NOTFOUND
++
++    fallible(|| {
++        let file = unwrap_file!(p_file, T)?;
++        let vfs = unwrap_vfs!(file.vfs, T)?;
++        vfs.file_control(&mut file.handle, op, p_arg)?;
++        Ok(vars::SQLITE_OK)
++    })
+ }
+ 
+ // system queries

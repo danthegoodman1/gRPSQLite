@@ -31,6 +31,8 @@ use crate::harness::Client;
 use crate::prng::Prng;
 
 const DB: &str = "vopr.db";
+/// The database the writer attaches for cross-database transactions.
+const DB_B: &str = "vopr-b.db";
 
 /// The most requests one step may send. Normal steps stay far below it.
 const STEP_REQUEST_BUDGET: u64 = 200_000;
@@ -127,6 +129,10 @@ pub struct Report {
     pub takeovers: u64,
     pub reopens: u64,
     pub vacuums: u64,
+    pub cross_database: u64,
+    /// Cross-database transactions whose failed COMMIT reached one database
+    /// and not the other.
+    pub split_commits: u64,
     pub reader_checks: u64,
     pub writer_checks: u64,
     /// The most requests any one step sent.
@@ -155,7 +161,11 @@ fn digest_rows(rows: &Rows) -> u64 {
 }
 
 fn digest_db(conn: &Connection) -> rusqlite::Result<u64> {
-    let mut stmt = conn.prepare_cached("SELECT k, v, tag FROM kv ORDER BY k")?;
+    digest_table(conn, "kv")
+}
+
+fn digest_table(conn: &Connection, table: &str) -> rusqlite::Result<u64> {
+    let mut stmt = conn.prepare_cached(&format!("SELECT k, v, tag FROM {table} ORDER BY k"))?;
     let mut rows = stmt.query([])?;
     let mut h = Xxh3::new();
     while let Some(row) = rows.next()? {
@@ -208,24 +218,50 @@ impl Op {
     }
 
     fn run(&self, conn: &Connection) -> rusqlite::Result<()> {
+        self.run_on(conn, "kv")
+    }
+
+    fn run_on(&self, conn: &Connection, table: &str) -> rusqlite::Result<()> {
         match self {
             Op::Put(k, v, tag) => conn
-                .prepare_cached("INSERT OR REPLACE INTO kv(k, v, tag) VALUES (?1, ?2, ?3)")?
+                .prepare_cached(&format!(
+                    "INSERT OR REPLACE INTO {table}(k, v, tag) VALUES (?1, ?2, ?3)"
+                ))?
                 .execute(params![k, v, tag])
                 .map(drop),
             Op::Delete(k) => conn
-                .prepare_cached("DELETE FROM kv WHERE k = ?1")?
+                .prepare_cached(&format!("DELETE FROM {table} WHERE k = ?1"))?
                 .execute(params![k])
                 .map(drop),
             Op::DeleteRange(lo, hi) => conn
-                .prepare_cached("DELETE FROM kv WHERE k BETWEEN ?1 AND ?2")?
+                .prepare_cached(&format!("DELETE FROM {table} WHERE k BETWEEN ?1 AND ?2"))?
                 .execute(params![lo, hi])
                 .map(drop),
             Op::Retag(lo, hi, tag) => conn
-                .prepare_cached("UPDATE kv SET tag = ?3 WHERE k BETWEEN ?1 AND ?2")?
+                .prepare_cached(&format!(
+                    "UPDATE {table} SET tag = ?3 WHERE k BETWEEN ?1 AND ?2"
+                ))?
                 .execute(params![lo, hi, tag])
                 .map(drop),
         }
+    }
+}
+
+fn random_op(rng: &mut Prng, cfg: &SimConfig) -> Op {
+    let k = rng.range(1..=cfg.key_space) as i64;
+    match rng.below(10) {
+        0..=5 => {
+            let len = if rng.percent(10) {
+                rng.index(cfg.max_value + 1)
+            } else {
+                rng.index(cfg.max_value.min(200) + 1)
+            };
+            let v = rng.bytes(len);
+            Op::Put(k, v, rng.below(16) as i64)
+        }
+        6 | 7 => Op::Delete(k),
+        8 => Op::DeleteRange(k, k + rng.below(20) as i64),
+        _ => Op::Retag(k, k + rng.below(50) as i64, rng.below(16) as i64),
     }
 }
 
@@ -247,6 +283,9 @@ struct Sim {
     /// Decides actions added after the original workload, so adding them
     /// leaves the original draws unchanged.
     extra: Prng,
+    /// Decides the cross-database steps, so they leave both streams above
+    /// unchanged.
+    attach: Prng,
     backend: Arc<SimBackend>,
     cache_bytes: u64,
     /// Clients created so far; each new client is a new machine with its
@@ -257,6 +296,9 @@ struct Sim {
     reader: Option<(Client, Option<Connection>)>,
     model: Rows,
     history: BTreeSet<u64>,
+    /// The attached database's committed rows.
+    model_b: Rows,
+    attached: bool,
     report: Report,
     verbose: bool,
     step: u64,
@@ -293,6 +335,7 @@ pub fn run_with(seed: u64, cfg: SimConfig, verbose: bool) -> Result<Report, Stri
         seed,
         rng: Prng::stream(seed, "workload"),
         extra: Prng::stream(seed, "workload-extra"),
+        attach: Prng::stream(seed, "workload-attach"),
         cfg,
         backend,
         cache_bytes,
@@ -302,6 +345,8 @@ pub fn run_with(seed: u64, cfg: SimConfig, verbose: bool) -> Result<Report, Stri
         reader: None,
         model: Rows::new(),
         history: BTreeSet::new(),
+        model_b: Rows::new(),
+        attached: false,
         report: Report::default(),
         verbose,
         step: 0,
@@ -375,6 +420,9 @@ impl Sim {
         self.backend.advance(dt);
         if self.cfg.point_in_time && self.extra.percent(5) {
             self.long_reader()?;
+        }
+        if self.cfg.atomic && self.attach.percent(5) {
+            self.cross_database()?;
         }
         let roll = self.rng.below(100);
         match roll {
@@ -477,21 +525,7 @@ impl Sim {
     }
 
     fn random_op(&mut self) -> Op {
-        let k = self.rng.range(1..=self.cfg.key_space) as i64;
-        match self.rng.below(10) {
-            0..=5 => {
-                let len = if self.rng.percent(10) {
-                    self.rng.index(self.cfg.max_value + 1)
-                } else {
-                    self.rng.index(self.cfg.max_value.min(200) + 1)
-                };
-                let v = self.rng.bytes(len);
-                Op::Put(k, v, self.rng.below(16) as i64)
-            }
-            6 | 7 => Op::Delete(k),
-            8 => Op::DeleteRange(k, k + self.rng.below(20) as i64),
-            _ => Op::Retag(k, k + self.rng.below(50) as i64, self.rng.below(16) as i64),
-        }
+        random_op(&mut self.rng, &self.cfg)
     }
 
     /// Runs one random transaction against the writer. Returns its outcome
@@ -858,10 +892,141 @@ impl Sim {
         Ok(())
     }
 
+    /// A transaction across the main database and an attached one, crashing
+    /// the client afterwards some of the time. Each database commits on its
+    /// own: when COMMIT fails, each holds its state from before or after the
+    /// transaction, independently.
+    fn cross_database(&mut self) -> Result<(), String> {
+        let backend = self.backend.clone();
+        let attached = backend.quietly(|| {
+            self.conn().execute_batch(&format!(
+                "ATTACH '{DB_B}' AS b;
+                 PRAGMA b.page_size={}; PRAGMA b.cache_size={}; PRAGMA b.journal_mode={};
+                 CREATE TABLE IF NOT EXISTS b.kv(k INTEGER PRIMARY KEY, v BLOB NOT NULL, tag INTEGER NOT NULL);",
+                self.cfg.page_size, self.cfg.cache_size, self.cfg.journal_mode
+            ))
+        });
+        if let Err(e) = attached {
+            // The attached database's lease may still belong to a crashed
+            // client, or the writer's lease lapsed.
+            self.note("attach-failed", 0);
+            if self.verbose {
+                eprintln!("    attach failed: {e}");
+            }
+            let _ = self.conn().execute_batch("DETACH b");
+            return Ok(());
+        }
+        self.attached = true;
+        let n = self.attach.range(1..=40);
+        let ops_a: Vec<Op> = (0..n)
+            .map(|_| random_op(&mut self.attach, &self.cfg))
+            .collect();
+        let ops_b: Vec<Op> = (0..n)
+            .map(|_| random_op(&mut self.attach, &self.cfg))
+            .collect();
+        let crash = self.attach.percent(30);
+        if crash {
+            self.backend.partition_after(self.attach.range(0..=40));
+        }
+        let (mut after_a, mut after_b) = (self.model.clone(), self.model_b.clone());
+        let body = (|| -> rusqlite::Result<()> {
+            self.conn().execute_batch("BEGIN")?;
+            for (a, b) in ops_a.iter().zip(&ops_b) {
+                a.run(self.conn())?;
+                a.apply(&mut after_a);
+                b.run_on(self.conn(), "b.kv")?;
+                b.apply(&mut after_b);
+            }
+            Ok(())
+        })();
+        let outcome = match body {
+            Err(e) => self.abandon(e, Outcome::Failed),
+            Ok(()) => match self.conn().execute_batch("COMMIT") {
+                Ok(()) => Outcome::Committed,
+                Err(e) => self.abandon(e, Outcome::CommitFailed),
+            },
+        };
+        self.note("cross-database", outcome as u64);
+        self.report.cross_database += 1;
+        if crash {
+            self.conn = None;
+            self.backend.heal();
+            self.backend.advance(self.backend.lease_ttl() + 1);
+            self.open_writer()?;
+        } else if backend
+            .quietly(|| self.conn().execute_batch("DETACH b"))
+            .is_err()
+        {
+            self.replace_writer()?;
+        }
+        let both_write = after_a != self.model && after_b != self.model_b;
+        let digest = self.quiet_digest()?;
+        let changed_a = digest != digest_rows(&self.model);
+        self.model = self.settle(outcome, digest, &self.model, after_a, DB)?;
+        self.history.insert(digest);
+        let digest_b = self.digest_b()?;
+        let changed_b = digest_b != digest_rows(&self.model_b);
+        self.model_b = self.settle(outcome, digest_b, &self.model_b, after_b, DB_B)?;
+        if both_write && changed_a != changed_b {
+            self.report.split_commits += 1;
+        }
+        if outcome == Outcome::Committed {
+            self.report.commits += 1;
+        }
+        Ok(())
+    }
+
+    /// The state a database holds after a transaction with `outcome`:
+    /// `after` once it committed, `before` if COMMIT never ran, either one
+    /// if COMMIT failed.
+    fn settle(
+        &self,
+        outcome: Outcome,
+        digest: u64,
+        before: &Rows,
+        after: Rows,
+        name: &str,
+    ) -> Result<Rows, String> {
+        let is_after = digest == digest_rows(&after);
+        let is_before = digest == digest_rows(before);
+        match outcome {
+            Outcome::Committed | Outcome::CommitFailed if is_after => Ok(after),
+            Outcome::RolledBack | Outcome::Failed | Outcome::CommitFailed if is_before => {
+                Ok(before.clone())
+            }
+            _ => Err(self.fail(format!(
+                "after a cross-database transaction ({outcome:?}) {name} holds an unexpected state"
+            ))),
+        }
+    }
+
+    /// The attached database's digest, read without faults through a new
+    /// client once the writer has detached it.
+    fn digest_b(&mut self) -> Result<u64, String> {
+        let backend = self.backend.clone();
+        for _ in 0..2 {
+            let client = Client::new(self.backend.clone(), None);
+            let result = backend.quietly(|| {
+                let c = client.open(DB_B)?;
+                c.busy_timeout(std::time::Duration::ZERO)?;
+                digest_table(&c, "kv")
+            });
+            if let Ok(d) = result {
+                return Ok(d);
+            }
+            // A close that failed under faults left a lease to expire.
+            self.backend.advance(self.backend.lease_ttl() + 1);
+        }
+        Err(self.fail("reading the attached database without faults failed"))
+    }
+
     fn final_check(&mut self) -> Result<(), String> {
         let digest = self.quiet_digest()?;
         if digest != digest_rows(&self.model) {
             return Err(self.fail("the final database differs from the model"));
+        }
+        if self.attached && self.digest_b()? != digest_rows(&self.model_b) {
+            return Err(self.fail("the attached database differs from its model"));
         }
         let backend = self.backend.clone();
         let msg: String = backend

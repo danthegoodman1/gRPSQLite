@@ -68,6 +68,8 @@ fn main() {
                             t.crashes += report.crashes;
                             t.takeovers += report.takeovers;
                             t.reader_checks += report.reader_checks;
+                            t.cross_database += report.cross_database;
+                            t.split_commits += report.split_commits;
                             t.peak_step_requests = t.peak_step_requests.max(report.peak_step_requests);
                             if verbose || seeds == 1 {
                                 println!("seed {seed}: ok {report:?}");
@@ -91,7 +93,7 @@ fn main() {
     }
     let t = totals.lock().unwrap_or_else(|e| e.into_inner());
     println!(
-        "seeds {first}..{}: steps={} commits={} ambiguous={} crashes={} takeovers={} reader_checks={} peak_step_requests={}",
+        "seeds {first}..{}: steps={} commits={} ambiguous={} crashes={} takeovers={} reader_checks={} cross_database={} split_commits={} peak_step_requests={}",
         first.wrapping_add(seeds),
         t.steps,
         t.commits,
@@ -99,6 +101,8 @@ fn main() {
         t.crashes,
         t.takeovers,
         t.reader_checks,
+        t.cross_database,
+        t.split_commits,
         t.peak_step_requests
     );
     if failed.load(Ordering::Relaxed) {

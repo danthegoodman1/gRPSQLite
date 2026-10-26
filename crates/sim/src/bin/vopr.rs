@@ -68,6 +68,7 @@ fn main() {
                             t.crashes += report.crashes;
                             t.takeovers += report.takeovers;
                             t.reader_checks += report.reader_checks;
+                            t.peak_step_requests = t.peak_step_requests.max(report.peak_step_requests);
                             if verbose || seeds == 1 {
                                 println!("seed {seed}: ok {report:?}");
                             }
@@ -90,14 +91,15 @@ fn main() {
     }
     let t = totals.lock().unwrap_or_else(|e| e.into_inner());
     println!(
-        "seeds {first}..{}: steps={} commits={} ambiguous={} crashes={} takeovers={} reader_checks={}",
+        "seeds {first}..{}: steps={} commits={} ambiguous={} crashes={} takeovers={} reader_checks={} peak_step_requests={}",
         first.wrapping_add(seeds),
         t.steps,
         t.commits,
         t.ambiguous_commits,
         t.crashes,
         t.takeovers,
-        t.reader_checks
+        t.reader_checks,
+        t.peak_step_requests
     );
     if failed.load(Ordering::Relaxed) {
         std::process::exit(1);

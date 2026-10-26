@@ -62,7 +62,9 @@ struct DbState {
     /// Read-write only: the main file's committed size.
     size: Option<u64>,
     cache: Option<PageCache>,
-    lost: bool,
+    /// Every operation fails until the database reopens: the lease is gone,
+    /// or a WAL write has an unknown outcome.
+    broken: bool,
 }
 
 impl DbState {
@@ -227,21 +229,21 @@ impl Core {
             return Ok(());
         }
         let mut st = db.state.lock();
-        if st.lost {
+        if st.broken {
             return Err(vars::SQLITE_IOERR);
         }
         if !self.backend.lease_valid(&db.session) {
-            mark_lost(db, &mut st);
+            mark_broken(db, &mut st, "lost the lease");
             return Err(vars::SQLITE_IOERR);
         }
         Ok(())
     }
 
-    /// Logs a failed request and returns `code`. A rejected lease marks the
-    /// database lost.
+    /// Logs a failed request and returns `code`. A rejected lease breaks the
+    /// database.
     fn fail(&self, db: &Db, op: &str, status: &Status, code: c_int) -> c_int {
         if is_lease_error(status) && !db.readonly {
-            mark_lost(db, &mut db.state.lock());
+            mark_broken(db, &mut db.state.lock(), "lost the lease");
         } else {
             log::error!("{op} {}: {status}", db.path);
         }
@@ -289,7 +291,7 @@ impl Core {
         let key = (path.to_string(), readonly);
         let mut dbs = self.dbs.lock();
         let db = match dbs.get(&key) {
-            Some(db) if !db.state.lock().lost => db.clone(),
+            Some(db) if !db.state.lock().broken => db.clone(),
             _ => {
                 let resp = self
                     .backend
@@ -677,7 +679,16 @@ impl Core {
                         data: Bytes::copy_from_slice(data),
                         checksum: xxh3_64(data),
                     })
-                    .map_err(|s| self.fail(&f.db, "write", &s, vars::SQLITE_IOERR_WRITE))?;
+                    .map_err(|s| {
+                        // SQLite treats a failed WAL write as one that never
+                        // happened and keeps its in-memory WAL index, but the
+                        // frames may have reached the server and completed a
+                        // commit. Reopening rebuilds the index from the server.
+                        if f.kind == FileKind::Wal {
+                            mark_broken(&f.db, &mut f.db.state.lock(), "a WAL write failed");
+                        }
+                        self.fail(&f.db, "write", &s, vars::SQLITE_IOERR_WRITE)
+                    })?;
             }
             Handle::Local(f) => {
                 let mut file = f.file.0.lock();
@@ -922,14 +933,11 @@ impl Core {
     }
 }
 
-fn mark_lost(db: &Db, st: &mut DbState) {
-    if !st.lost {
-        log::error!(
-            "lost the lease for {}; reopen the database to continue",
-            db.path
-        );
+fn mark_broken(db: &Db, st: &mut DbState, why: &str) {
+    if !st.broken {
+        log::error!("{why} for {}; reopen the database to continue", db.path);
     }
-    st.lost = true;
+    st.broken = true;
     st.forget();
 }
 

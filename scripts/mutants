@@ -6,6 +6,9 @@ Usage: scripts/mutants [--seeds N] [--first SEED] [NAME...]
 
 Each mutant replaces text in one file. A mutant counts as caught when the
 VOPR fails on some seed in the range; the report names the first such seed.
+A VOPR run that outlives TIMEOUT seconds also counts as caught: the
+simulator's request budget should have ended any loop, so the hang is a
+liveness failure of its own.
 """
 
 import argparse
@@ -16,6 +19,7 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+TIMEOUT = 600
 VFS = "crates/vfs/src/vfs.rs"
 CACHE = "crates/vfs/src/cache.rs"
 
@@ -122,11 +126,16 @@ def main() -> int:
                 print(f"{name}: does not compile\n{build.stderr[-2000:]}")
                 missed.append(name)
                 continue
-            run = subprocess.run(
-                [str(target / "release" / "vopr"), str(args.first), "--seeds", str(args.seeds)],
-                capture_output=True,
-                text=True,
-            )
+            try:
+                run = subprocess.run(
+                    [str(target / "release" / "vopr"), str(args.first), "--seeds", str(args.seeds)],
+                    capture_output=True,
+                    text=True,
+                    timeout=TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                print(f"{name}: caught ({guarantee})\n    the VOPR hung for {TIMEOUT} s")
+                continue
             failure = next((l for l in run.stderr.splitlines() if l.startswith("FAILED")), None)
             if run.returncode != 0 and failure:
                 print(f"{name}: caught ({guarantee})\n    {failure}")

@@ -102,6 +102,18 @@ pub fn register_static(
     Ok(())
 }
 
+/// Unregisters a VFS that [`register_static`] registered and frees its
+/// `Core`.
+///
+/// # Safety
+///
+/// No SQLite connection may still use the VFS.
+#[cfg(feature = "static")]
+pub unsafe fn unregister_static(name: &str) -> Result<(), c_int> {
+    let name = vfs_name(name)?;
+    unsafe { sqlite_plugin::vfs::unregister_static::<GrpsqliteVfs>(&name) }
+}
+
 /// Registers the VFS from the environment as SQLite's default. Pass
 /// `-DSQLITE_EXTRA_INIT=grpsqlite_extra_init` when compiling SQLite, which
 /// then calls this at the end of `sqlite3_initialize`.

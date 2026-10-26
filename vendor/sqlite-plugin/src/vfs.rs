@@ -323,6 +323,28 @@ pub fn register_static<T: Vfs>(
     register_inner(SqliteApi::new_static(), name, vfs, opts)
 }
 
+/// Unregister a vfs that [`register_static`] registered and free it.
+/// # Safety
+/// `name` must name a vfs that `register_static::<T>` registered, and no
+/// `SQLite` connection or file may still use it.
+#[cfg(feature = "static")]
+pub unsafe fn unregister_static<T: Vfs>(name: &CStr) -> VfsResult<()> {
+    let p_vfs = unsafe { ffi::sqlite3_vfs_find(name.as_ptr()) };
+    if p_vfs.is_null() {
+        return Err(vars::SQLITE_NOTFOUND);
+    }
+    let result = unsafe { ffi::sqlite3_vfs_unregister(p_vfs) };
+    if result != vars::SQLITE_OK {
+        return Err(result);
+    }
+    unsafe {
+        let vfs = Box::from_raw(p_vfs);
+        drop(Box::from_raw(vfs.pAppData.cast::<AppData<T>>()));
+        drop(CString::from_raw(vfs.zName as *mut c_char));
+    }
+    Ok(())
+}
+
 /// Register a vfs with `SQLite` using the dynamic API. This API is available when
 /// `SQLite` is initializing extensions.
 /// # Safety

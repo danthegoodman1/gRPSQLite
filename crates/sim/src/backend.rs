@@ -48,6 +48,14 @@ pub struct SimState {
     partitioned: bool,
     /// Partition after this many more requests.
     partition_after: Option<u64>,
+    /// Requests left before every request fails; see [`SimBackend::set_budget`].
+    budget: Option<u64>,
+    budget_spent: bool,
+    /// Lose the response of the request with this name after this many
+    /// more of them; see [`SimBackend::lose_response_of`].
+    lose_nth: Option<(String, u64)>,
+    /// The request being handled loses its response.
+    lose_this: bool,
 }
 
 pub struct SimBackend {
@@ -76,6 +84,10 @@ impl SimBackend {
                 leases: BTreeMap::new(),
                 partitioned: false,
                 partition_after: None,
+                budget: None,
+                budget_spent: false,
+                lose_nth: None,
+                lose_this: false,
             }),
         }
     }
@@ -116,6 +128,30 @@ impl SimBackend {
         self.state.lock().partition_after = Some(requests);
     }
 
+    /// Loses the response of the `nth` next request named `name` (1 is the
+    /// next one) after the server applies it.
+    pub fn lose_response_of(&self, name: &str, nth: u64) {
+        self.state.lock().lose_nth = Some((name.to_string(), nth));
+    }
+
+    /// Fails every request after `requests` more, so a client stuck in a
+    /// retry loop ends with an error the simulator can report.
+    pub fn set_budget(&self, requests: u64) {
+        let mut st = self.state.lock();
+        st.budget = Some(requests);
+        st.budget_spent = false;
+    }
+
+    /// Requests left in the budget.
+    pub fn budget_left(&self) -> u64 {
+        self.state.lock().budget.unwrap_or(u64::MAX)
+    }
+
+    /// Whether a request failed because the budget ran out.
+    pub fn budget_spent(&self) -> bool {
+        self.state.lock().budget_spent
+    }
+
     pub fn heal(&self) {
         let mut st = self.state.lock();
         st.partitioned = false;
@@ -129,6 +165,15 @@ impl SimBackend {
                 track.stalled = true;
             }
         }
+    }
+
+    /// Whether some client's lease on `database` has lapsed, as that client
+    /// sees it.
+    pub fn lease_lapsed(&self, database: &str) -> bool {
+        let st = self.state.lock();
+        st.leases.values().any(|t| {
+            t.database == database && (t.lost || st.now.saturating_sub(t.last_ok_sent) >= t.ttl)
+        })
     }
 
     /// Advances simulated time, sending each heartbeat that falls due.
@@ -181,6 +226,24 @@ impl SimBackend {
     /// Admits a request: counts it and applies partitions and early faults.
     fn admit(st: &mut SimState, name: &str) -> Result<(), Status> {
         *st.counts.entry(name.to_string()).or_default() += 1;
+        st.lose_this = false;
+        if let Some((target, n)) = &mut st.lose_nth {
+            if target == name {
+                *n -= 1;
+                if *n == 0 {
+                    st.lose_nth = None;
+                    st.lose_this = true;
+                }
+            }
+        }
+        match st.budget {
+            Some(0) => {
+                st.budget_spent = true;
+                return Err(Status::resource_exhausted("request budget spent"));
+            }
+            Some(n) => st.budget = Some(n - 1),
+            None => {}
+        }
         if let Some(n) = st.partition_after {
             if n == 0 {
                 st.partitioned = true;
@@ -201,6 +264,9 @@ impl SimBackend {
 
     /// Loses the response of an applied change.
     fn lose_response(st: &mut SimState) -> bool {
+        if std::mem::take(&mut st.lose_this) {
+            return true;
+        }
         let rate = st.faults.fail_after;
         st.quiet == 0 && st.rng.per_mille(rate)
     }

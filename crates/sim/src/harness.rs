@@ -3,8 +3,8 @@
 //! own sessions, leases and caches.
 
 use std::ffi::c_int;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 
 use grpsqlite::cache::CacheSettings;
 use grpsqlite::{Backend, Config, Core};
@@ -37,9 +37,31 @@ fn install_logger() {
     }
 }
 
+/// Turns off SQLite's memory statistics, which take a global mutex on every
+/// allocation and so serialize seeds running on parallel threads. SQLite
+/// accepts the setting only before it initializes.
+fn configure_sqlite() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0 as c_int);
+    });
+}
+
 pub struct Client {
     pub name: String,
     pub core: Arc<Core>,
+}
+
+impl Drop for Client {
+    /// Frees the VFS once no connection uses it. A client dropped while one
+    /// of its connections is open leaves its VFS registered.
+    fn drop(&mut self) {
+        if self.core.is_idle() {
+            // SAFETY: an idle core has no open files, so no connection uses
+            // the VFS.
+            let _ = unsafe { grpsqlite::unregister_static(&self.name) };
+        }
+    }
 }
 
 impl Client {
@@ -52,6 +74,7 @@ impl Client {
         config: Result<Config, String>,
         cache: Option<CacheSettings>,
     ) -> Client {
+        configure_sqlite();
         let name = format!("grpsqlite-sim-{}", NEXT_VFS.fetch_add(1, Ordering::Relaxed));
         let core = Arc::new(Core::with_cache(backend, config, cache));
         install_logger();
@@ -78,6 +101,7 @@ impl Client {
 
 /// Seeds SQLite's PRNG, which picks journal nonces and temporary names.
 pub fn seed_sqlite(seed: u64) {
+    configure_sqlite();
     unsafe {
         rusqlite::ffi::sqlite3_test_control(
             rusqlite::ffi::SQLITE_TESTCTRL_PRNG_SEED,

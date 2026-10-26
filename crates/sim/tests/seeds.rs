@@ -35,10 +35,20 @@ fn a_seed_replays_exactly() {
 /// (`r6_exclusive_locking_is_rejected_with_atomic_commits` in `repro.rs`).
 #[test]
 fn regressions() {
-    for (seed, bug) in [(
-        303,
-        "a failed close left a lease that blocked the next open",
-    )] {
+    for (seed, bug) in [
+        (
+            303,
+            "a failed close left a lease that blocked the next open",
+        ),
+        (
+            1_000_316,
+            "an integrity check reported a read refused after lease loss as corruption",
+        ),
+        (
+            1_007_275,
+            "a WAL write that lost its response left the writer reading a state the server no longer held",
+        ),
+    ] {
         if let Err(e) = vopr::run(seed, false) {
             panic!("{bug}: {e}");
         }

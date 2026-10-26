@@ -32,6 +32,9 @@ use crate::prng::Prng;
 
 const DB: &str = "vopr.db";
 
+/// The most requests one step may send. Normal steps stay far below it.
+const STEP_REQUEST_BUDGET: u64 = 200_000;
+
 /// The simulated deployment, drawn from the seed.
 #[derive(Clone, Debug)]
 pub struct SimConfig {
@@ -122,6 +125,8 @@ pub struct Report {
     pub vacuums: u64,
     pub reader_checks: u64,
     pub writer_checks: u64,
+    /// The most requests any one step sent.
+    pub peak_step_requests: u64,
     /// A hash of every observable result, equal across replays of a seed.
     pub trace: u64,
 }
@@ -332,31 +337,52 @@ impl Sim {
     }
 
     fn run(&mut self) -> Result<(), String> {
-        self.open_writer()?;
-        self.quiet_setup()?;
+        self.bounded(|sim| {
+            sim.open_writer()?;
+            sim.quiet_setup()
+        })?;
         self.history.insert(digest_rows(&self.model));
         for step in 0..self.cfg.steps {
             self.step = step;
             self.report.steps += 1;
-            let dt = self.rng.range(0..=1500);
-            self.backend.advance(dt);
-            if self.cfg.point_in_time && self.extra.percent(5) {
-                self.long_reader()?;
-            }
-            let roll = self.rng.below(100);
-            match roll {
-                0..=49 => self.transaction(false)?,
-                50..=59 => self.check_writer()?,
-                60..=64 => self.integrity()?,
-                65..=69 => self.reopen()?,
-                70..=73 => self.vacuum()?,
-                74..=85 if self.cfg.point_in_time => self.check_reader()?,
-                86..=91 if self.cfg.crashes => self.crash()?,
-                92..=94 if self.cfg.takeovers => self.takeover()?,
-                _ => self.transaction(true)?,
-            }
+            self.bounded(Sim::run_step)?;
         }
-        self.final_check()
+        self.bounded(Sim::final_check)
+    }
+
+    /// Runs `f` within [`STEP_REQUEST_BUDGET`] requests. A step that spends
+    /// the budget is stuck in a loop: a liveness failure.
+    fn bounded(&mut self, f: impl FnOnce(&mut Sim) -> Result<(), String>) -> Result<(), String> {
+        self.backend.set_budget(STEP_REQUEST_BUDGET);
+        let result = f(self);
+        if self.backend.budget_spent() {
+            return Err(self.fail(format!(
+                "sent over {STEP_REQUEST_BUDGET} requests in one step: a client is stuck in a loop"
+            )));
+        }
+        let spent = STEP_REQUEST_BUDGET - self.backend.budget_left();
+        self.report.peak_step_requests = self.report.peak_step_requests.max(spent);
+        result
+    }
+
+    fn run_step(&mut self) -> Result<(), String> {
+        let dt = self.rng.range(0..=1500);
+        self.backend.advance(dt);
+        if self.cfg.point_in_time && self.extra.percent(5) {
+            self.long_reader()?;
+        }
+        let roll = self.rng.below(100);
+        match roll {
+            0..=49 => self.transaction(false),
+            50..=59 => self.check_writer(),
+            60..=64 => self.integrity(),
+            65..=69 => self.reopen(),
+            70..=73 => self.vacuum(),
+            74..=85 if self.cfg.point_in_time => self.check_reader(),
+            86..=91 if self.cfg.crashes => self.crash(),
+            92..=94 if self.cfg.takeovers => self.takeover(),
+            _ => self.transaction(true),
+        }
     }
 
     fn conn(&self) -> &Connection {
@@ -580,18 +606,27 @@ impl Sim {
     }
 
     /// The writer's digest with faults off. A writer that lost its lease is
-    /// reopened once the lease expires.
+    /// replaced once the lease expires.
     fn quiet_digest(&mut self) -> Result<u64, String> {
+        if self.backend.lease_lapsed(DB) {
+            self.replace_writer()?;
+        }
         let backend = self.backend.clone();
         if let Ok(d) = backend.quietly(|| digest_db(self.conn())) {
             return Ok(d);
         }
-        self.conn = None;
-        self.backend.advance(self.backend.lease_ttl() + 1);
-        backend.quietly(|| self.open_writer())?;
+        self.replace_writer()?;
         backend
             .quietly(|| digest_db(self.conn()))
             .map_err(|e| self.fail(format!("reading without faults failed: {e}")))
+    }
+
+    /// Closes the writer and, once its lease has expired, opens a new one.
+    fn replace_writer(&mut self) -> Result<(), String> {
+        self.conn = None;
+        self.backend.advance(self.backend.lease_ttl() + 1);
+        let backend = self.backend.clone();
+        backend.quietly(|| self.open_writer())
     }
 
     fn check_writer(&mut self) -> Result<(), String> {
@@ -610,16 +645,29 @@ impl Sim {
     /// page reads in its output.
     fn integrity(&mut self) -> Result<(), String> {
         let backend = self.backend.clone();
-        let result: rusqlite::Result<String> = backend.quietly(|| {
-            self.conn()
-                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-        });
-        if let Ok(msg) = result
-            && msg != "ok"
-        {
-            return Err(self.fail(format!("integrity_check: {msg}")));
+        let check = |sim: &Sim| -> rusqlite::Result<String> {
+            backend.quietly(|| {
+                sim.conn()
+                    .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            })
+        };
+        match check(self) {
+            Ok(msg) if msg == "ok" => Ok(()),
+            // SQLite reports a page it could not read as an integrity error.
+            // With faults off, reads fail only once the writer's lease has
+            // lapsed; in exclusive locking mode SQLite's own page cache can
+            // hide that until a read misses it.
+            Ok(msg) if msg.contains("unable to get the page") && self.backend.lease_lapsed(DB) => {
+                self.replace_writer()?;
+                match check(self) {
+                    Ok(msg) if msg == "ok" => Ok(()),
+                    Ok(msg) => Err(self.fail(format!("integrity_check: {msg}"))),
+                    Err(e) => Err(self.fail(format!("integrity_check without faults failed: {e}"))),
+                }
+            }
+            Ok(msg) => Err(self.fail(format!("integrity_check: {msg}"))),
+            Err(_) => Ok(()),
         }
-        Ok(())
     }
 
     fn reopen(&mut self) -> Result<(), String> {
@@ -847,8 +895,12 @@ impl Sim {
         Ok(())
     }
 
+    /// Closes every connection before the clients that own their VFSes.
     fn shutdown(&mut self) {
         self.conn = None;
+        if let Some((_, conn)) = &mut self.reader {
+            *conn = None;
+        }
         self.reader = None;
     }
 }

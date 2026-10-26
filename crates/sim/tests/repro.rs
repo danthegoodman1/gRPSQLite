@@ -1,5 +1,5 @@
-//! The bugs found in the review of `e2a2d84` (R1–R11 in `PLAN.md`), each
-//! replayed against the simulated server.
+//! The bugs found in the review of `e2a2d84` (R1–R11 in `PLAN.md`) and by
+//! the VOPR since, each replayed against the simulated server.
 
 use std::sync::Arc;
 
@@ -304,4 +304,46 @@ fn r10_cached_pages_follow_commits() {
         0,
         "the lease holder reads cached pages locally"
     );
+}
+
+/// On a server without atomic commits, a WAL write can reach the server and
+/// lose its response. If it was a commit's last write, the server holds the
+/// commit while SQLite believes it failed. The writer must stop reading until
+/// it reopens and recovers the WAL from the server.
+#[test]
+fn wal_write_with_a_lost_response_breaks_the_writer() {
+    let (backend, client) = setup(non_atomic());
+    let wal = "PRAGMA locking_mode=exclusive; PRAGMA journal_mode=wal;";
+    let insert = "INSERT INTO t1 VALUES (2)";
+    // A dry run counts the WAL writes of one insert.
+    let conn = client.open("wal-dry.db").unwrap();
+    conn.execute_batch(wal).unwrap();
+    conn.execute_batch("CREATE TABLE t1(a); INSERT INTO t1 VALUES (1);")
+        .unwrap();
+    let before = backend.count("write.wal");
+    conn.execute_batch(insert).unwrap();
+    let writes = backend.count("write.wal") - before;
+    drop(conn);
+
+    let conn = client.open("wal.db").unwrap();
+    conn.execute_batch(wal).unwrap();
+    conn.execute_batch("CREATE TABLE t1(a); INSERT INTO t1 VALUES (1);")
+        .unwrap();
+    backend.lose_response_of("write.wal", writes);
+    assert!(conn.execute_batch(insert).is_err());
+    let read = conn.query_row("SELECT count(*) FROM t1", [], |r| r.get::<_, i64>(0));
+    assert!(
+        read.is_err(),
+        "the writer read {read:?} after a failed WAL write"
+    );
+    drop(conn);
+
+    let conn = client.open("wal.db").unwrap();
+    conn.execute_batch(wal).unwrap();
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM t1"),
+        2,
+        "the commit reached the server"
+    );
+    assert_eq!(integrity(&conn), "ok");
 }

@@ -45,6 +45,10 @@ fn regressions() {
             "an integrity check reported a read refused after lease loss as corruption",
         ),
         (
+            67_294,
+            "an integrity check reported a read refused after lease loss as corruption",
+        ),
+        (
             1_007_275,
             "a WAL write that lost its response left the writer reading a state the server no longer held",
         ),

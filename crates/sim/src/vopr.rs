@@ -641,8 +641,9 @@ impl Sim {
             // SQLite reports a page it could not read as an integrity error.
             // With faults off, reads fail only once the writer's lease has
             // lapsed; in exclusive locking mode SQLite's own page cache can
-            // hide that until a read misses it.
-            Ok(msg) if msg.contains("unable to get the page") && self.backend.lease_lapsed(DB) => {
+            // hide that until a read misses it. A new writer reads the
+            // server's pages, so the second check still finds corruption.
+            Ok(_) if self.backend.lease_lapsed(DB) => {
                 self.replace_writer()?;
                 match check(self) {
                     Ok(msg) if msg == "ok" => Ok(()),

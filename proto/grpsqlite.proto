@@ -59,6 +59,12 @@ service Grpsqlite {
   // Pragma runs a server-defined pragma. The client forwards only pragmas
   // whose names start with `grpsqlite_`. Return NOT_FOUND for unknown names.
   rpc Pragma(PragmaRequest) returns (PragmaResponse);
+
+  // ChangedPages lists the parts of the main file that changed between two
+  // versions, so a read-only client can keep its cached pages without asking
+  // about each one. Only servers that set changed_pages receive it. Return
+  // OUT_OF_RANGE when `since` is no longer known.
+  rpc ChangedPages(ChangedPagesRequest) returns (ChangedPagesResponse);
 }
 
 // The three files a database can have on the server. Servers with
@@ -106,6 +112,8 @@ message OpenResponse {
   // using a lease that many milliseconds after it sent the last heartbeat the
   // server accepted. 0 means three heartbeat intervals.
   uint64 lease_ttl_millis = 7;
+  // The server implements ChangedPages.
+  bool changed_pages = 8;
 }
 
 message CloseRequest {
@@ -145,6 +153,9 @@ message ReadResponse {
   // The requested bytes hash to the request's checksum, so the client may
   // use its cached copy. Servers may always leave this unset.
   bool checksum_matched = 3;
+  // The file's size at the version read. Optional: a read-only client that
+  // receives it skips GetFileSize for the rest of its read transaction.
+  optional uint64 size = 4;
 }
 
 message WriteRequest {
@@ -213,4 +224,25 @@ message PragmaRequest {
 message PragmaResponse {
   // Returned to SQLite as the pragma's result row. Empty means no result.
   string response = 1;
+}
+
+message ChangedPagesRequest {
+  // Always FILE_KIND_MAIN, from a read-only session.
+  FileRef file = 1;
+  // An earlier version the client's cache is valid at.
+  bytes since = 2;
+  // A later version: list everything that differs between the two.
+  bytes until = 3;
+}
+
+message ByteRange {
+  uint64 offset = 1;
+  uint64 length = 2;
+}
+
+message ChangedPagesResponse {
+  // Byte ranges that differ between `since` and `until`, including bytes
+  // added or removed by a change of size. Listing more than changed is
+  // allowed; listing less is not.
+  repeated ByteRange ranges = 1;
 }

@@ -75,6 +75,13 @@ MUTANTS = [
         "        if false && name == \"locking_mode\"",
     ),
     (
+        "changed-pages-ignored",
+        "G6: a replica's cache drops every page that changed",
+        CACHE,
+        "                    self.invalidate(offset, offset.saturating_add(len));",
+        "                    let _ = (offset, len);",
+    ),
+    (
         "cache-skips-checksum",
         "G6: a damaged cache never changes an answer",
         CACHE,

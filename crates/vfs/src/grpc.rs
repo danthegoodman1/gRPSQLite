@@ -228,6 +228,14 @@ impl Backend for GrpcBackend {
         self.call(async move { c.pragma(req).await })
     }
 
+    fn changed_pages(
+        &self,
+        req: proto::ChangedPagesRequest,
+    ) -> Result<proto::ChangedPagesResponse, Status> {
+        let mut c = self.client()?;
+        self.call(async move { c.changed_pages(req).await })
+    }
+
     fn lease_valid(&self, session: &str) -> bool {
         let Some(state) = self.leases.lock().get(session).cloned() else {
             return true;

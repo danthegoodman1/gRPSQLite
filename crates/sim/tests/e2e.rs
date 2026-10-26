@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use grpsqlite::{GrpcBackend, GrpcConfig};
 use grpsqlite_memory::{Options, Service, Store};
+use grpsqlite_sim::cache::{CacheFaults, SimCacheStores};
 use grpsqlite_sim::harness::{Client, sqlite_code};
+use grpsqlite_sim::prng::Prng;
 use parking_lot::Mutex;
 use rusqlite::ErrorCode;
 
@@ -43,13 +45,26 @@ impl Server {
     }
 
     fn client(&self) -> Client {
+        self.client_with(None)
+    }
+
+    /// A client with a page cache.
+    fn cached_client(&self) -> Client {
+        self.client_with(Some(SimCacheStores::settings(
+            CacheFaults::default(),
+            Prng::new(1),
+            64 << 20,
+        )))
+    }
+
+    fn client_with(&self, cache: Option<grpsqlite::cache::CacheSettings>) -> Client {
         let config = GrpcConfig {
             url: format!("http://{}", self.addr),
             connect_timeout: Duration::from_secs(2),
             rpc_timeout: Duration::from_secs(5),
             ..GrpcConfig::default()
         };
-        Client::new(Arc::new(GrpcBackend::new(&config).unwrap()), None)
+        Client::new(Arc::new(GrpcBackend::new(&config).unwrap()), cache)
     }
 
     fn stop(self) -> SocketAddr {
@@ -105,6 +120,33 @@ fn replica_reads_committed_state_while_the_writer_works() {
         .execute_batch("INSERT INTO t VALUES (5)")
         .unwrap_err();
     assert_eq!(sqlite_code(&err), Some(ErrorCode::ReadOnly));
+}
+
+#[test]
+fn a_cached_replica_follows_commits() {
+    let server = Server::start(Options::default());
+    let writer_client = server.client();
+    let writer = writer_client.open("cached.db").unwrap();
+    writer
+        .execute_batch(
+            "CREATE TABLE t(x INTEGER PRIMARY KEY, y);
+             WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i < 2000)
+             INSERT INTO t SELECT i, printf('%0100d', i) FROM s;",
+        )
+        .unwrap();
+    let replica_client = server.cached_client();
+    let replica = replica_client.open_readonly("cached.db").unwrap();
+    assert_eq!(count(&replica, "SELECT count(*) FROM t WHERE y = 'z'"), 0);
+    for round in 1..=3 {
+        writer
+            .execute_batch(&format!("UPDATE t SET y = 'z' WHERE x % 100 = {round}"))
+            .unwrap();
+        assert_eq!(
+            count(&replica, "SELECT count(*) FROM t WHERE y = 'z'"),
+            20 * round,
+            "the replica's cache drops the pages each commit changed"
+        );
+    }
 }
 
 #[test]

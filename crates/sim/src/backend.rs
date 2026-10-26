@@ -227,13 +227,13 @@ impl SimBackend {
     fn admit(st: &mut SimState, name: &str) -> Result<(), Status> {
         *st.counts.entry(name.to_string()).or_default() += 1;
         st.lose_this = false;
-        if let Some((target, n)) = &mut st.lose_nth {
-            if target == name {
-                *n -= 1;
-                if *n == 0 {
-                    st.lose_nth = None;
-                    st.lose_this = true;
-                }
+        if let Some((target, n)) = &mut st.lose_nth
+            && target == name
+        {
+            *n -= 1;
+            if *n == 0 {
+                st.lose_nth = None;
+                st.lose_this = true;
             }
         }
         match st.budget {
@@ -370,6 +370,15 @@ impl Backend for SimBackend {
         let mut st = self.state.lock();
         Self::admit(&mut st, "pragma")?;
         st.store.pragma(req)
+    }
+
+    fn changed_pages(
+        &self,
+        req: proto::ChangedPagesRequest,
+    ) -> Result<proto::ChangedPagesResponse, Status> {
+        let mut st = self.state.lock();
+        Self::admit(&mut st, "changed_pages")?;
+        st.store.changed_pages(req)
     }
 
     fn lease_valid(&self, session: &str) -> bool {

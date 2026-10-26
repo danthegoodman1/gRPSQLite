@@ -1,18 +1,25 @@
 //! The local page cache.
 //!
 //! A read-write database's cache is authoritative while this process holds
-//! the lease: a cached page is served without a request. A read-only
-//! database's cache saves bandwidth only: each read sends the cached copy's
-//! checksum, and the server answers "unchanged" or with the bytes. Every page
-//! served from the cache is checked against its checksum first, so a damaged
-//! cache costs a request, never a wrong answer.
+//! the lease: a cached page is served without a request.
+//!
+//! A read-only database's cache tracks the version its pages are current at.
+//! When a read transaction starts at a newer version, the server's
+//! ChangedPages list says which pages to drop, and the transaction then reads
+//! cached pages without a request. On servers without ChangedPages, each read
+//! sends the cached copy's checksum instead, and the server answers
+//! "unchanged" or with the bytes.
+//!
+//! Every page served from the cache is checked against its checksum first,
+//! so a damaged cache costs a request, never a wrong answer.
 //!
 //! A cache outlives its process. At a clean close it writes a manifest of its
 //! pages. A read-write cache records the header's change counter, which
 //! SQLite increments with every commit in rollback-journal modes; when the
 //! database next opens, the pages count only if the server's header still
-//! carries that counter. Opening removes the manifest, so a crash leaves
-//! none and the next open starts empty.
+//! carries that counter. A read-only cache records its version. Opening
+//! removes the manifest, so a crash leaves none and the next open starts
+//! empty.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -161,6 +168,8 @@ struct Entry {
 struct Manifest {
     /// The header's change counter, for a read-write cache.
     counter: Option<[u8; 4]>,
+    /// The version the pages are current at, for a read-only cache.
+    version: Option<Bytes>,
     page_size: u64,
     /// `(offset, len, checksum)`, least recently used first.
     pages: Vec<(u64, u64, u64)>,
@@ -178,6 +187,14 @@ impl Manifest {
                 out.extend_from_slice(&c);
             }
             None => out.extend_from_slice(&[0; 5]),
+        }
+        match &self.version {
+            Some(v) => {
+                out.push(1);
+                out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                out.extend_from_slice(v);
+            }
+            None => out.push(0),
         }
         out.extend_from_slice(&self.page_size.to_le_bytes());
         out.extend_from_slice(&(self.pages.len() as u64).to_le_bytes());
@@ -198,6 +215,17 @@ impl Manifest {
             1 => Some(*counter),
             _ => return None,
         };
+        let (flag, rest) = rest.split_first()?;
+        let (version, rest) = match flag {
+            0 => (None, rest),
+            1 => {
+                let (len, rest) = rest.split_first_chunk::<8>()?;
+                let len = usize::try_from(u64::from_le_bytes(*len)).ok()?;
+                let (v, rest) = rest.split_at_checked(len)?;
+                (Some(Bytes::copy_from_slice(v)), rest)
+            }
+            _ => return None,
+        };
         let (page_size, rest) = rest.split_first_chunk::<8>()?;
         let (count, mut rest) = rest.split_first_chunk::<8>()?;
         let count = u64::from_le_bytes(*count);
@@ -213,6 +241,7 @@ impl Manifest {
         }
         Some(Manifest {
             counter,
+            version,
             page_size: u64::from_le_bytes(*page_size),
             pages,
         })
@@ -236,6 +265,8 @@ pub struct PageCache {
     page_size: u64,
     /// A read-write manifest waiting for the server's header.
     pending: Option<Manifest>,
+    /// Read-only: the version every cached page is current at, if known.
+    valid_at: Option<Bytes>,
 }
 
 /// The page size recorded in a database header, if `data` starts with one.
@@ -276,6 +307,7 @@ impl PageCache {
             max_bytes: settings.max_bytes,
             page_size: 0,
             pending: None,
+            valid_at: None,
         };
         match manifest {
             Some(m) if reusable && readonly => cache.adopt(m),
@@ -287,6 +319,7 @@ impl PageCache {
 
     fn adopt(&mut self, m: Manifest) {
         self.page_size = m.page_size;
+        self.valid_at = m.version;
         for (offset, len, checksum) in m.pages {
             let tick = self.next_tick;
             self.next_tick += 1;
@@ -324,6 +357,7 @@ impl PageCache {
         };
         let manifest = Manifest {
             counter,
+            version: self.valid_at.clone(),
             page_size: self.page_size,
             pages: self
                 .recency
@@ -342,6 +376,28 @@ impl PageCache {
         self.recency.clear();
         self.bytes = 0;
         self.pending = None;
+        self.valid_at = None;
+    }
+
+    /// The version every cached page is current at, if known.
+    pub fn valid_at(&self) -> Option<&Bytes> {
+        self.valid_at.as_ref()
+    }
+
+    /// Makes the cache current at `version` by dropping the byte ranges in
+    /// `changed`, which lists everything that differs from the version the
+    /// cache was current at. `None` means the differences are unknown and
+    /// empties the cache.
+    pub fn advance_to(&mut self, version: Bytes, changed: Option<&[(u64, u64)]>) {
+        match changed {
+            Some(ranges) => {
+                for &(offset, len) in ranges {
+                    self.invalidate(offset, offset.saturating_add(len));
+                }
+            }
+            None => self.clear(),
+        }
+        self.valid_at = Some(version);
     }
 
     /// Learns the page size from a header the server sent, and decides a
@@ -591,13 +647,61 @@ mod tests {
 
     #[test]
     fn manifest_round_trips() {
-        let m = Manifest {
+        let writer = Manifest {
             counter: Some([1, 2, 3, 4]),
+            version: None,
             page_size: 4096,
             pages: vec![(0, 4096, 9), (8192, 4096, 10)],
         };
-        assert_eq!(Manifest::decode(&m.encode()), Some(m));
+        let reader = Manifest {
+            counter: None,
+            version: Some(Bytes::from_static(b"v42")),
+            page_size: 512,
+            pages: vec![(512, 512, 11)],
+        };
+        for m in [writer, reader] {
+            assert_eq!(Manifest::decode(&m.encode()), Some(m));
+        }
         assert_eq!(Manifest::decode(b"GSQLCM01garbage"), None);
+    }
+
+    fn reader_cache(store: &Shared) -> PageCache {
+        PageCache::open(&settings(store), "db", true, true).unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn advancing_drops_only_changed_pages() {
+        let store = Shared::default();
+        let mut c = reader_cache(&store);
+        c.put_read(0, 512, Bytes::from(header(1)));
+        for page in 1..4u8 {
+            c.put_read(page as u64 * 512, 512, Bytes::from(vec![page; 512]));
+        }
+        c.advance_to(Bytes::from_static(b"v1"), Some(&[]));
+        c.advance_to(Bytes::from_static(b"v2"), Some(&[(1024, 10)]));
+        assert_eq!(c.valid_at(), Some(&Bytes::from_static(b"v2")));
+        let mut buf = [0u8; 512];
+        assert_eq!(c.read(512, &mut buf), Some(512));
+        assert_eq!(c.read(1024, &mut buf), None, "a changed page is dropped");
+        assert_eq!(c.read(1536, &mut buf), Some(512));
+        c.advance_to(Bytes::from_static(b"v3"), None);
+        assert!(c.is_empty(), "unknown changes empty the cache");
+        assert_eq!(c.valid_at(), Some(&Bytes::from_static(b"v3")));
+    }
+
+    #[test]
+    fn reader_keeps_its_version_across_restarts() {
+        let store = Shared::default();
+        let mut c = reader_cache(&store);
+        c.put_read(0, 512, Bytes::from(header(1)));
+        c.put_read(512, 512, Bytes::from(vec![7u8; 512]));
+        c.advance_to(Bytes::from_static(b"v9"), Some(&[]));
+        c.close(None);
+        let mut c = reader_cache(&store);
+        assert_eq!(c.valid_at(), Some(&Bytes::from_static(b"v9")));
+        let mut buf = [0u8; 512];
+        assert_eq!(c.read(512, &mut buf), Some(512));
+        assert_eq!(buf, [7u8; 512]);
     }
 
     #[test]

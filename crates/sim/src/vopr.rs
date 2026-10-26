@@ -53,6 +53,9 @@ pub struct SimConfig {
     pub max_value: usize,
     pub steps: u64,
     pub retained_versions: u64,
+    /// The server answers ChangedPages, so replicas validate their caches in
+    /// bulk instead of page by page.
+    pub changed_pages: bool,
     /// Ask for exclusive locking on a server with atomic commits, which the
     /// VFS must refuse.
     pub try_exclusive: bool,
@@ -107,6 +110,7 @@ impl SimConfig {
             max_value: *rng.pick(&[16, 200, 2000, 20_000]),
             steps: rng.range(40..=200),
             retained_versions: *rng.pick(&[3, 50, 10_000]),
+            changed_pages: Prng::stream(seed, "config-changed-pages").percent(70),
             try_exclusive: atomic && Prng::stream(seed, "config-exclusive").percent(20),
         }
     }
@@ -269,6 +273,7 @@ pub fn run_with(seed: u64, cfg: SimConfig, verbose: bool) -> Result<Report, Stri
         heartbeat_interval_ms: 1000,
         lease_ttl_ms: 5000,
         retained_versions: cfg.retained_versions,
+        changed_pages: cfg.changed_pages,
     };
     let backend = Arc::new(SimBackend::new(
         opts,

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! memory-server [--addr 127.0.0.1:50051] [--no-atomic] [--no-pit]
-//!               [--lease-ttl-ms 5000] [--latency-ms 0]
+//!               [--no-changed-pages] [--lease-ttl-ms 5000] [--latency-ms 0]
 //! ```
 
 use std::sync::Arc;
@@ -22,6 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--addr" => addr = args.next().ok_or("--addr needs a value")?,
             "--no-atomic" => opts.atomic_commit = false,
             "--no-pit" => opts.point_in_time_reads = false,
+            "--no-changed-pages" => opts.changed_pages = false,
             "--lease-ttl-ms" => {
                 opts.lease_ttl_ms = args.next().ok_or("--lease-ttl-ms needs a value")?.parse()?;
                 opts.heartbeat_interval_ms = (opts.lease_ttl_ms / 5).max(1);

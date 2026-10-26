@@ -23,6 +23,12 @@ pub trait Backend: Send + Sync + 'static {
     fn truncate(&self, req: proto::TruncateRequest) -> Result<(), Status>;
     fn delete(&self, req: proto::DeleteRequest) -> Result<(), Status>;
     fn pragma(&self, req: proto::PragmaRequest) -> Result<proto::PragmaResponse, Status>;
+    /// Lists what changed in the main file between two versions; servers
+    /// that set `OpenResponse.changed_pages` implement it.
+    fn changed_pages(
+        &self,
+        req: proto::ChangedPagesRequest,
+    ) -> Result<proto::ChangedPagesResponse, Status>;
     /// Whether the session's lease is still safe to use: the server has not
     /// rejected a heartbeat, and the last accepted heartbeat was sent less
     /// than the lease's TTL ago.

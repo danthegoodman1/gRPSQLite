@@ -60,6 +60,12 @@ impl Backend for Unconfigured {
     fn pragma(&self, _: proto::PragmaRequest) -> Result<proto::PragmaResponse, tonic::Status> {
         Err(tonic::Status::unavailable("grpsqlite is not configured"))
     }
+    fn changed_pages(
+        &self,
+        _: proto::ChangedPagesRequest,
+    ) -> Result<proto::ChangedPagesResponse, tonic::Status> {
+        Err(tonic::Status::unavailable("grpsqlite is not configured"))
+    }
     fn lease_valid(&self, _: &str) -> bool {
         false
     }

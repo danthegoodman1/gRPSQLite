@@ -65,6 +65,28 @@ fn full_scan(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Point lookups on `reader` while `writer` updates one row after every
+/// tenth. Each `round` writes new values: SQLite skips writing a row whose
+/// bytes stay the same.
+fn lookups_under_writes(
+    writer: &Connection,
+    reader: &Connection,
+    round: i64,
+) -> rusqlite::Result<()> {
+    let mut rng = Prng::new(4);
+    let mut get = reader.prepare_cached("SELECT length(v) FROM kv WHERE k = ?1")?;
+    let mut put = writer.prepare_cached("UPDATE kv SET v = printf('%0200d', ?2) WHERE k = ?1")?;
+    for i in 0..LOOKUPS {
+        let k = rng.range(1..=ROWS) as i64;
+        let _: i64 = get.query_row(params![k], |r| r.get(0))?;
+        if i % 10 == 9 {
+            let k = rng.range(1..=ROWS) as i64;
+            put.execute(params![k, round * LOOKUPS as i64 + i as i64])?;
+        }
+    }
+    Ok(())
+}
+
 type Workload = (&'static str, fn(&Connection) -> rusqlite::Result<()>);
 
 const WORKLOADS: [Workload; 3] = [
@@ -141,11 +163,43 @@ fn count_requests() -> rusqlite::Result<()> {
     row(&sim, "writer, page cache, reopened", "full scan");
     drop(conn);
 
-    for (label, cache) in [("replica", None), ("replica, page cache", cache())] {
+    drop(sim);
+    replica_rows(true)?;
+    replica_rows(false)
+}
+
+/// Replicas on a server with or without ChangedPages. The writer has a page
+/// cache, so the requests during its updates are the replica's plus the
+/// writer's commits, which the table leaves out.
+fn replica_rows(changed_pages: bool) -> rusqlite::Result<()> {
+    let sim = Arc::new(SimBackend::simple(Options {
+        changed_pages,
+        ..Options::default()
+    }));
+    let backend: Arc<dyn Backend> = sim.clone();
+    let writer = Client::new(backend.clone(), cache());
+    let wconn = writer.open("bench.db")?;
+    fill(&wconn)?;
+    let clients = if changed_pages {
+        vec![("replica", None), ("replica, page cache", cache())]
+    } else {
+        vec![("replica, page cache, no ChangedPages", cache())]
+    };
+    for (label, cache) in clients {
         let reader = Client::new(backend.clone(), cache);
         let conn = reader.open_readonly("bench.db")?;
         conn.execute_batch(PAGE_CACHE)?;
         warm_rows(&sim, &conn, label)?;
+        lookups_under_writes(&wconn, &conn, 0)?;
+        sim.reset_counts();
+        lookups_under_writes(&wconn, &conn, 1)?;
+        let commits = sim.count("commit");
+        println!(
+            "| {label} | 500 point lookups while a writer commits {commits} times | {} | {} | 0 |",
+            requests(&sim) - commits,
+            sim.count("read.main"),
+        );
+        sim.reset_counts();
     }
     Ok(())
 }
@@ -168,7 +222,7 @@ fn timed(latency: Duration) -> Result<(), Box<dyn std::error::Error>> {
     };
     let backend: Arc<dyn Backend> = Arc::new(GrpcBackend::new(&config)?);
     println!(
-        "\nWall time over gRPC, {} ms added to every response, cold runs.\n",
+        "\nWall time over gRPC, {} ms added to every response. Clients without a page cache start cold; clients with one run each workload once to warm it.\n",
         latency.as_millis()
     );
     println!("| Client | Workload | Seconds |");
@@ -182,8 +236,13 @@ fn timed(latency: Duration) -> Result<(), Box<dyn std::error::Error>> {
         start.elapsed().as_secs_f64()
     );
     drop(conn);
-    for (label, readonly) in [("writer", false), ("replica", true)] {
-        let client = Client::new(backend.clone(), None);
+    for (label, readonly, cached) in [
+        ("writer", false, false),
+        ("writer, page cache", false, true),
+        ("replica", true, false),
+        ("replica, page cache", true, true),
+    ] {
+        let client = Client::new(backend.clone(), if cached { cache() } else { None });
         for (name, f) in WORKLOADS {
             let conn = if readonly {
                 client.open_readonly("timed.db")?
@@ -191,6 +250,9 @@ fn timed(latency: Duration) -> Result<(), Box<dyn std::error::Error>> {
                 client.open("timed.db")?
             };
             conn.execute_batch(PAGE_CACHE)?;
+            if cached {
+                f(&conn)?;
+            }
             let start = Instant::now();
             f(&conn)?;
             println!(

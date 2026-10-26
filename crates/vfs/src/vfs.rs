@@ -52,6 +52,8 @@ struct Db {
     session: String,
     lease: String,
     atomic: bool,
+    /// The server lists changed pages, so a read-only cache advances in bulk.
+    changed_pages: bool,
     sector_size: i32,
     state: Mutex<DbState>,
 }
@@ -135,6 +137,9 @@ pub struct MainFile {
     id: u64,
     /// Read-only: the version this read transaction observes, or empty.
     snapshot: Bytes,
+    /// Read-only: the main file's size at `snapshot`, once a response
+    /// carried it.
+    snapshot_size: Option<u64>,
     /// Writes since the transaction began, sent at sync.
     txn: Overlay,
     /// Committed bytes fetched ahead of a sequential scan, from `.0`. Valid
@@ -147,6 +152,20 @@ pub struct MainFile {
 }
 
 impl MainFile {
+    /// Read-only: whether `cache` is current at this transaction's version,
+    /// so its pages need no request.
+    fn trusts(&self, cache: &PageCache) -> bool {
+        self.db.changed_pages
+            && !self.snapshot.is_empty()
+            && cache.valid_at() == Some(&self.snapshot)
+    }
+
+    /// Whether bytes this handle read may enter `cache`: a read-only cache
+    /// that tracks its version takes only pages read at that version.
+    fn may_fill(&self, cache: &PageCache) -> bool {
+        !self.db.readonly || !self.db.changed_pages || self.trusts(cache)
+    }
+
     fn forget_ahead(&mut self) {
         self.ahead = None;
         self.run = 0;
@@ -363,6 +382,7 @@ impl Core {
                     session: resp.session,
                     lease: resp.lease,
                     atomic: resp.atomic_commit,
+                    changed_pages: resp.changed_pages,
                     sector_size: match resp.sector_size {
                         0 => 4096,
                         s => s as i32,
@@ -381,6 +401,7 @@ impl Core {
             db,
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             snapshot: Bytes::new(),
+            snapshot_size: None,
             txn: Overlay::default(),
             ahead: None,
             next_read: 0,
@@ -554,7 +575,7 @@ impl Core {
     fn main_size(&self, f: &mut MainFile) -> VfsResult<u64> {
         self.check(&f.db)?;
         let known = if f.db.readonly {
-            None
+            f.snapshot_size
         } else {
             f.db.state.lock().size
         };
@@ -570,8 +591,9 @@ impl Core {
                     .map_err(|s| self.fail(&f.db, "size", &s, vars::SQLITE_IOERR_FSTAT))?;
                 if f.db.readonly {
                     if f.snapshot.is_empty() {
-                        f.snapshot = resp.version;
+                        self.pin(f, resp.version);
                     }
+                    f.snapshot_size = Some(resp.size);
                 } else {
                     f.db.state.lock().size = Some(resp.size);
                 }
@@ -633,7 +655,13 @@ impl Core {
         let mut checksum = 0;
         if db.readonly {
             if let Some(cache) = &mut db.state.lock().cache {
-                checksum = cache.checksum(offset, len);
+                if f.trusts(cache) {
+                    if let Some(n) = cache.read(offset, buf) {
+                        return Ok(n);
+                    }
+                } else {
+                    checksum = cache.checksum(offset, len);
+                }
             }
         } else {
             let mut st = db.state.lock();
@@ -676,8 +704,13 @@ impl Core {
                 checksum: if fetch == len { checksum } else { 0 },
             })
             .map_err(|s| self.fail(&db, "read", &s, vars::SQLITE_IOERR_READ))?;
-        if db.readonly && f.snapshot.is_empty() {
-            f.snapshot = resp.version.clone();
+        if db.readonly {
+            if f.snapshot.is_empty() {
+                self.pin(f, resp.version.clone());
+            }
+            if resp.size.is_some() {
+                f.snapshot_size = resp.size;
+            }
         }
         if resp.checksum_matched {
             let mut st = db.state.lock();
@@ -698,7 +731,9 @@ impl Core {
         if !db.readonly && offset == 0 && st.header.as_ref().is_none_or(|h| h.len() < n) {
             st.header = Some(resp.data[..n].to_vec());
         }
-        if let Some(cache) = &mut st.cache {
+        if let Some(cache) = &mut st.cache
+            && f.may_fill(cache)
+        {
             let mut at = 0;
             while at < resp.data.len() {
                 let end = (at + buf.len()).min(resp.data.len());
@@ -726,10 +761,59 @@ impl Core {
             .map_err(|s| self.fail(&f.db, "read", &s, vars::SQLITE_IOERR_READ))?;
         let n = resp.data.len().min(buf.len());
         buf[..n].copy_from_slice(&resp.data[..n]);
-        if let Some(cache) = &mut f.db.state.lock().cache {
+        if let Some(cache) = &mut f.db.state.lock().cache
+            && f.may_fill(cache)
+        {
             cache.put_read(offset, buf.len() as u64, resp.data.slice(..n));
         }
         Ok(n)
+    }
+
+    /// Fixes the version a read-only transaction observes, from the first
+    /// response that carried one, and brings the cache to that version.
+    fn pin(&self, f: &mut MainFile, version: Bytes) {
+        f.snapshot = version;
+        if !f.db.changed_pages {
+            return;
+        }
+        let since = {
+            let mut st = f.db.state.lock();
+            let Some(cache) = &mut st.cache else {
+                return;
+            };
+            match cache.valid_at() {
+                Some(v) if *v == f.snapshot => return,
+                Some(v) => v.clone(),
+                None => {
+                    cache.advance_to(f.snapshot.clone(), None);
+                    return;
+                }
+            }
+        };
+        let resp = self.backend.changed_pages(proto::ChangedPagesRequest {
+            file: f.db.file(FileKind::Main),
+            since: since.clone(),
+            until: f.snapshot.clone(),
+        });
+        let mut st = f.db.state.lock();
+        let Some(cache) = &mut st.cache else {
+            return;
+        };
+        // Another handle may have advanced the cache meanwhile.
+        if cache.valid_at() != Some(&since) {
+            return;
+        }
+        match resp {
+            Ok(r) => {
+                let ranges: Vec<(u64, u64)> =
+                    r.ranges.iter().map(|r| (r.offset, r.length)).collect();
+                cache.advance_to(f.snapshot.clone(), Some(&ranges));
+            }
+            Err(s) => {
+                log::debug!("changed pages of {}: {s}; emptying the cache", f.db.path);
+                cache.advance_to(f.snapshot.clone(), None);
+            }
+        }
     }
 
     pub fn write(&self, handle: &mut Handle, offset: usize, data: &[u8]) -> VfsResult<usize> {
@@ -923,6 +1007,7 @@ impl Core {
         }
         if level == LockLevel::Unlocked {
             f.snapshot = Bytes::new();
+            f.snapshot_size = None;
         }
         Ok(())
     }

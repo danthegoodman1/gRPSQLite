@@ -26,6 +26,8 @@ pub struct Options {
     /// With point-in-time reads, how many versions before the latest stay
     /// readable.
     pub retained_versions: u64,
+    /// With point-in-time reads, answer ChangedPages.
+    pub changed_pages: bool,
 }
 
 impl Default for Options {
@@ -36,6 +38,7 @@ impl Default for Options {
             heartbeat_interval_ms: 1000,
             lease_ttl_ms: 5000,
             retained_versions: 10_000,
+            changed_pages: true,
         }
     }
 }
@@ -123,6 +126,7 @@ impl Store {
             sector_size: 4096,
             heartbeat_interval_millis: self.opts.heartbeat_interval_ms,
             lease_ttl_millis: self.opts.lease_ttl_ms,
+            changed_pages: self.lists_changed_pages(),
         })
     }
 
@@ -158,10 +162,13 @@ impl Store {
             return Ok(proto::ReadResponse::default());
         };
         let version = self.read_version(db, &file, &req.version)?;
-        let data = match kind {
-            FileKind::Main => db.main.read(version, req.offset, req.length),
-            FileKind::Journal => read_flat(&db.journal, req.offset, req.length),
-            FileKind::Wal => read_flat(&db.wal, req.offset, req.length),
+        let (data, size) = match kind {
+            FileKind::Main => (
+                db.main.read(version, req.offset, req.length),
+                Some(db.main.size_at(version)),
+            ),
+            FileKind::Journal => (read_flat(&db.journal, req.offset, req.length), None),
+            FileKind::Wal => (read_flat(&db.wal, req.offset, req.length), None),
         };
         let version = self.encode_version(version);
         if req.checksum != 0 && xxh3_64(&data) == req.checksum {
@@ -169,13 +176,42 @@ impl Store {
                 data: Bytes::new(),
                 version,
                 checksum_matched: true,
+                size,
             });
         }
         Ok(proto::ReadResponse {
             data: data.into(),
             version,
             checksum_matched: false,
+            size,
         })
+    }
+
+    pub fn changed_pages(
+        &mut self,
+        req: proto::ChangedPagesRequest,
+    ) -> Result<proto::ChangedPagesResponse, Status> {
+        if !self.lists_changed_pages() {
+            return Err(Status::unimplemented("ChangedPages is off"));
+        }
+        let file = req.file.unwrap_or_default();
+        if file_kind(&file)? != FileKind::Main {
+            return Err(Status::invalid_argument(
+                "ChangedPages applies to the main file",
+            ));
+        }
+        let Some(db) = self.databases.get(&file.database) else {
+            return Ok(proto::ChangedPagesResponse::default());
+        };
+        let since = self.read_version(db, &file, &req.since)?;
+        let until = self.read_version(db, &file, &req.until)?;
+        let ranges = db
+            .main
+            .changed(since, until)
+            .into_iter()
+            .map(|(offset, length)| proto::ByteRange { offset, length })
+            .collect();
+        Ok(proto::ChangedPagesResponse { ranges })
     }
 
     pub fn get_file_size(
@@ -363,6 +399,10 @@ impl Store {
 
     /// The version a read observes: the requested one for read-only sessions
     /// on a point-in-time server, otherwise the latest.
+    fn lists_changed_pages(&self) -> bool {
+        self.opts.point_in_time_reads && self.opts.changed_pages
+    }
+
     fn read_version(
         &self,
         db: &Database,
@@ -523,6 +563,23 @@ impl VersionedFile {
         set_at_version(&mut self.sizes, version, size);
     }
 
+    /// The byte ranges that differ between versions `since` and `until`.
+    fn changed(&self, since: u64, until: u64) -> Vec<(u64, u64)> {
+        let (since, until) = (since.min(until), since.max(until));
+        let mut ranges: Vec<(u64, u64)> = self
+            .chunks
+            .iter()
+            .filter(|(_, h)| h.iter().any(|(v, _)| *v > since && *v <= until))
+            .map(|(index, _)| (index * CHUNK, CHUNK))
+            .collect();
+        let (a, b) = (self.size_at(since), self.size_at(until));
+        if a != b {
+            ranges.push((a.min(b), a.max(b) - a.min(b)));
+            ranges.sort_unstable();
+        }
+        ranges
+    }
+
     /// Forgets history older than `oldest`, keeping the state as of `oldest`.
     fn prune(&mut self, oldest: u64) {
         for history in self.chunks.values_mut() {
@@ -664,6 +721,13 @@ impl proto::grpsqlite_server::Grpsqlite for Service {
         r: Request<proto::PragmaRequest>,
     ) -> Result<Response<proto::PragmaResponse>, Status> {
         self.call(|s, _| s.pragma(r.into_inner())).await
+    }
+
+    async fn changed_pages(
+        &self,
+        r: Request<proto::ChangedPagesRequest>,
+    ) -> Result<Response<proto::ChangedPagesResponse>, Status> {
+        self.call(|s, _| s.changed_pages(r.into_inner())).await
     }
 }
 

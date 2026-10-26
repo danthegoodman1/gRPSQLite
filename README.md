@@ -69,7 +69,7 @@ Clients without a page cache start cold. Clients with one run each workload once
 
 ## Quick start
 
-Linux with Rust, a C compiler, `curl`, `openssl` and `unzip`. Start the in-memory reference server, then build a SQLite 3.54.1 shell with gRPSQLite as its default VFS:
+Linux with Rust, a C compiler, libclang (`libclang-dev` on Debian and Ubuntu), `curl`, `openssl` and `unzip`. Start the in-memory reference server, then build a SQLite 3.54.1 shell with gRPSQLite as its default VFS:
 
 ```console
 cargo run --release -p grpsqlite-memory &   # listens on 127.0.0.1:50051

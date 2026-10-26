@@ -29,6 +29,9 @@ use crate::overlay::Overlay;
 
 const PRAGMA_PREFIX: &str = "grpsqlite_";
 
+/// The most a sequential scan reads ahead in one request.
+const MAX_READ_AHEAD: u64 = 1 << 20;
+
 /// The VFS state shared by every handle.
 pub struct Core {
     backend: Arc<dyn Backend>,
@@ -132,6 +135,37 @@ pub struct MainFile {
     snapshot: Bytes,
     /// Writes since the transaction began, sent at sync.
     txn: Overlay,
+    /// Committed bytes fetched ahead of a sequential scan, from `.0`. Valid
+    /// until the read transaction ends or this handle commits.
+    ahead: Option<(u64, Bytes)>,
+    /// Where the next read of a sequential scan would start.
+    next_read: u64,
+    /// How many page reads in a row were sequential.
+    run: u32,
+}
+
+impl MainFile {
+    fn forget_ahead(&mut self) {
+        self.ahead = None;
+        self.run = 0;
+    }
+
+    /// How many bytes to fetch for a read of `len` at `offset`: one page,
+    /// doubling along a sequential run of whole-page reads.
+    fn fetch_len(&mut self, offset: u64, len: u64) -> u64 {
+        let page_like =
+            len.is_power_of_two() && (512..=65536).contains(&len) && offset.is_multiple_of(len);
+        self.run = if page_like && offset == self.next_read {
+            self.run + 1
+        } else {
+            0
+        };
+        self.next_read = offset + len;
+        if self.run < 2 {
+            return len;
+        }
+        (len << (self.run - 1).min(6)).min(MAX_READ_AHEAD).max(len)
+    }
 }
 
 pub struct RemoteFile {
@@ -316,7 +350,11 @@ impl Core {
                 let cache = self
                     .cache
                     .as_ref()
-                    .and_then(|c| PageCache::open(c, path, readonly));
+                    // Every commit through an atomic server updates the
+                    // header's change counter, which confirms reused pages.
+                    .and_then(|c| {
+                        PageCache::open(c, path, readonly, readonly || resp.atomic_commit)
+                    });
                 let db = Arc::new(Db {
                     path: path.to_string(),
                     readonly,
@@ -342,6 +380,9 @@ impl Core {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
             snapshot: Bytes::new(),
             txn: Overlay::default(),
+            ahead: None,
+            next_read: 0,
+            run: 0,
         }))
     }
 
@@ -425,8 +466,11 @@ impl Core {
             self.local
                 .lock()
                 .retain(|name, _| *name != journal && !name.starts_with(&super_prefix));
-            if let Some(cache) = db.state.lock().cache.take() {
-                cache.close();
+        }
+        {
+            let mut st = db.state.lock();
+            if let Some(cache) = st.cache.take() {
+                cache.close(st.header.as_deref());
             }
         }
         // Holding `dbs` makes a concurrent open of this database wait until
@@ -591,30 +635,43 @@ impl Core {
             }
         } else {
             let mut st = db.state.lock();
-            if let Some(h) = &st.header {
-                if offset + len <= h.len() as u64 {
-                    let start = offset as usize;
-                    buf.copy_from_slice(&h[start..start + buf.len()]);
-                    return Ok(buf.len());
-                }
+            if let Some(h) = &st.header
+                && offset + len <= h.len() as u64
+            {
+                let start = offset as usize;
+                buf.copy_from_slice(&h[start..start + buf.len()]);
+                return Ok(buf.len());
             }
             if st.size.is_some_and(|size| offset >= size) {
                 return Ok(0);
             }
-            if let Some(cache) = &mut st.cache {
-                if let Some(n) = cache.read(offset, buf) {
-                    return Ok(n);
-                }
+            if let Some(cache) = &mut st.cache
+                && let Some(n) = cache.read(offset, buf)
+            {
+                return Ok(n);
             }
+        }
+        if let Some((start, data)) = &f.ahead
+            && offset >= *start
+            && offset + len <= *start + data.len() as u64
+        {
+            let from = (offset - start) as usize;
+            buf.copy_from_slice(&data[from..from + buf.len()]);
+            f.next_read = offset + len;
+            return Ok(buf.len());
+        }
+        let mut fetch = f.fetch_len(offset, len);
+        if let Some(size) = (!db.readonly).then(|| db.state.lock().size).flatten() {
+            fetch = fetch.min(size.saturating_sub(offset)).max(len);
         }
         let resp = self
             .backend
             .read(proto::ReadRequest {
                 file: db.file(FileKind::Main),
                 offset,
-                length: len,
+                length: fetch,
                 version: f.snapshot.clone(),
-                checksum,
+                checksum: if fetch == len { checksum } else { 0 },
             })
             .map_err(|s| self.fail(&db, "read", &s, vars::SQLITE_IOERR_READ))?;
         if db.readonly && f.snapshot.is_empty() {
@@ -640,7 +697,16 @@ impl Core {
             st.header = Some(resp.data[..n].to_vec());
         }
         if let Some(cache) = &mut st.cache {
-            cache.put_read(offset, len, resp.data.slice(..n));
+            let mut at = 0;
+            while at < resp.data.len() {
+                let end = (at + buf.len()).min(resp.data.len());
+                cache.put_read(offset + at as u64, len, resp.data.slice(at..end));
+                at = end;
+            }
+        }
+        drop(st);
+        if resp.data.len() > buf.len() {
+            f.ahead = Some((offset, resp.data));
         }
         Ok(n)
     }
@@ -701,6 +767,7 @@ impl Core {
             f.txn.write(offset, data);
             return Ok(());
         }
+        f.forget_ahead();
         let data = Bytes::copy_from_slice(data);
         let result = self.backend.write(proto::WriteRequest {
             file: f.db.file(FileKind::Main),
@@ -734,6 +801,7 @@ impl Core {
                     f.txn.truncate(size);
                     return Ok(());
                 }
+                f.forget_ahead();
                 let result = self.backend.truncate(proto::TruncateRequest {
                     file: f.db.file(FileKind::Main),
                     size,
@@ -776,6 +844,7 @@ impl Core {
     }
 
     fn commit(&self, f: &mut MainFile) -> VfsResult<()> {
+        f.forget_ahead();
         if f.txn.is_empty() {
             return Ok(());
         }
@@ -833,6 +902,7 @@ impl Core {
             return Ok(());
         };
         f.db.state.lock().locks.unlock(f.id, level);
+        f.forget_ahead();
         if level < LockLevel::Reserved && !f.txn.is_empty() {
             log::debug!(
                 "discarding writes of an unfinished transaction on {}",
@@ -913,10 +983,10 @@ impl Core {
     /// Discards the transaction of a main-database handle whose operation
     /// failed with an I/O error: SQLite now rolls the transaction back.
     fn after(&self, handle: &mut Handle, result: VfsResult<()>) -> VfsResult<()> {
-        if let (Err(code), Handle::Main(f)) = (&result, handle) {
-            if is_ioerr(*code) {
-                f.txn.clear();
-            }
+        if let (Err(code), Handle::Main(f)) = (&result, handle)
+            && is_ioerr(*code)
+        {
+            f.txn.clear();
         }
         result
     }

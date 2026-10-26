@@ -6,7 +6,8 @@ exclude = ["vendor/sqlite-plugin"]
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+# File::try_lock, which keeps two processes off one page cache.
+rust-version = "1.89"
 
 [workspace.dependencies]
 bytes = "1"

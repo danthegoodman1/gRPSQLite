@@ -2,14 +2,16 @@
 //!
 //! One multi-thread runtime with a single worker owns one channel and every
 //! heartbeat task. The channel's background work runs on that worker between
-//! SQLite calls, so idle periods leave the connection healthy.
+//! SQLite calls, so idle periods leave the connection healthy. The runtime
+//! starts with the first request, so a host that loads SQLite and then forks
+//! starts its threads in the child.
 
 #![allow(clippy::disallowed_types, clippy::disallowed_methods)]
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use grpsqlite_proto as proto;
@@ -22,10 +24,15 @@ use crate::backend::{Backend, is_lease_error};
 use crate::config::GrpcConfig;
 
 pub struct GrpcBackend {
-    runtime: tokio::runtime::Runtime,
-    client: GrpsqliteClient<Channel>,
+    endpoint: Endpoint,
+    connection: OnceLock<Result<Connection, String>>,
     leases: Mutex<BTreeMap<String, Arc<LeaseState>>>,
     start: Instant,
+}
+
+struct Connection {
+    runtime: tokio::runtime::Runtime,
+    client: GrpsqliteClient<Channel>,
 }
 
 /// What the heartbeat task knows about one lease.
@@ -41,15 +48,9 @@ struct LeaseState {
 const DEFAULT_HEARTBEAT_MS: u64 = 5000;
 
 impl GrpcBackend {
-    /// Builds the runtime and a lazy channel. No connection is made until the
-    /// first request.
+    /// Checks the configuration. The runtime and channel start with the first
+    /// request.
     pub fn new(config: &GrpcConfig) -> Result<GrpcBackend, String> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("grpsqlite")
-            .enable_all()
-            .build()
-            .map_err(|e| format!("starting the gRPC runtime: {e}"))?;
         let endpoint = Endpoint::from_shared(config.url.clone())
             .map_err(|e| format!("GRPSQLITE_URL={:?}: {e}", config.url))?
             .connect_timeout(config.connect_timeout)
@@ -57,16 +58,38 @@ impl GrpcBackend {
             .http2_keep_alive_interval(config.keepalive_interval)
             .keep_alive_timeout(config.keepalive_timeout)
             .keep_alive_while_idle(true);
-        let channel = {
-            let _guard = runtime.enter();
-            endpoint.connect_lazy()
-        };
         Ok(GrpcBackend {
-            runtime,
-            client: GrpsqliteClient::new(channel),
+            endpoint,
+            connection: OnceLock::new(),
             leases: Mutex::new(BTreeMap::new()),
             start: Instant::now(),
         })
+    }
+
+    fn connection(&self) -> Result<&Connection, Status> {
+        self.connection
+            .get_or_init(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("grpsqlite")
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("starting the gRPC runtime: {e}"))?;
+                let channel = {
+                    let _guard = runtime.enter();
+                    self.endpoint.connect_lazy()
+                };
+                Ok(Connection {
+                    runtime,
+                    client: GrpsqliteClient::new(channel),
+                })
+            })
+            .as_ref()
+            .map_err(|e| Status::unavailable(e.clone()))
+    }
+
+    fn client(&self) -> Result<GrpsqliteClient<Channel>, Status> {
+        Ok(self.connection()?.client.clone())
     }
 
     fn now_ms(&self) -> u64 {
@@ -81,7 +104,7 @@ impl GrpcBackend {
         F: Future<Output = Result<tonic::Response<T>, Status>> + Send + 'static,
     {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.runtime.spawn(async move {
+        self.connection()?.runtime.spawn(async move {
             let _ = tx.send(fut.await.map(tonic::Response::into_inner));
         });
         rx.recv()
@@ -94,7 +117,8 @@ impl GrpcBackend {
         database: &str,
         resp: &proto::OpenResponse,
         sent_at: u64,
-    ) {
+    ) -> Result<(), Status> {
+        let connection = self.connection()?;
         let interval = match resp.heartbeat_interval_millis {
             0 => DEFAULT_HEARTBEAT_MS,
             ms => ms,
@@ -110,9 +134,9 @@ impl GrpcBackend {
         };
         let state = Arc::new_cyclic(|weak: &std::sync::Weak<LeaseState>| {
             let weak = weak.clone();
-            let mut client = self.client.clone();
+            let mut client = connection.client.clone();
             let start = self.start;
-            let task = self.runtime.spawn(async move {
+            let task = connection.runtime.spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(interval));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 ticker.tick().await;
@@ -142,6 +166,7 @@ impl GrpcBackend {
             }
         });
         self.leases.lock().insert(session.to_string(), state);
+        Ok(())
     }
 }
 
@@ -149,10 +174,10 @@ impl Backend for GrpcBackend {
     fn open(&self, req: proto::OpenRequest) -> Result<proto::OpenResponse, Status> {
         let database = req.database.clone();
         let sent_at = self.now_ms();
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         let resp = self.call(async move { c.open(req).await })?;
         if !resp.lease.is_empty() {
-            self.start_heartbeat(&resp.session, &database, &resp, sent_at);
+            self.start_heartbeat(&resp.session, &database, &resp, sent_at)?;
         }
         Ok(resp)
     }
@@ -161,22 +186,22 @@ impl Backend for GrpcBackend {
         if let Some(state) = self.leases.lock().remove(&req.session) {
             state.task.abort();
         }
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         self.call(async move { c.close(req).await }).map(drop)
     }
 
     fn read(&self, req: proto::ReadRequest) -> Result<proto::ReadResponse, Status> {
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         self.call(async move { c.read(req).await })
     }
 
     fn write(&self, req: proto::WriteRequest) -> Result<(), Status> {
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         self.call(async move { c.write(req).await }).map(drop)
     }
 
     fn commit(&self, req: proto::CommitRequest) -> Result<proto::CommitResponse, Status> {
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         self.call(async move { c.commit(req).await })
     }
 
@@ -184,22 +209,22 @@ impl Backend for GrpcBackend {
         &self,
         req: proto::GetFileSizeRequest,
     ) -> Result<proto::GetFileSizeResponse, Status> {
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         self.call(async move { c.get_file_size(req).await })
     }
 
     fn truncate(&self, req: proto::TruncateRequest) -> Result<(), Status> {
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         self.call(async move { c.truncate(req).await }).map(drop)
     }
 
     fn delete(&self, req: proto::DeleteRequest) -> Result<(), Status> {
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         self.call(async move { c.delete(req).await }).map(drop)
     }
 
     fn pragma(&self, req: proto::PragmaRequest) -> Result<proto::PragmaResponse, Status> {
-        let mut c = self.client.clone();
+        let mut c = self.client()?;
         self.call(async move { c.pragma(req).await })
     }
 

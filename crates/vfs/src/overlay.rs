@@ -123,11 +123,11 @@ impl Overlay {
     /// `buf` lie within the file.
     pub fn apply(&self, offset: u64, buf: &mut [u8], committed_len: usize) -> usize {
         let end = offset + buf.len() as u64;
-        if let Some(cut) = self.cut {
-            if cut < end {
-                let from = cut.saturating_sub(offset) as usize;
-                buf[from..].fill(0);
-            }
+        if let Some(cut) = self.cut
+            && cut < end
+        {
+            let from = cut.saturating_sub(offset) as usize;
+            buf[from..].fill(0);
         }
         for (s, d) in self.extents.range(..end) {
             let e = s + d.len() as u64;

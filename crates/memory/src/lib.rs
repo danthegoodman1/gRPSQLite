@@ -100,13 +100,13 @@ impl Store {
             let id = self.next_id("lease-");
             let ttl = self.opts.lease_ttl_ms;
             let db = self.databases.entry(req.database).or_default();
-            if let Some(held) = &db.lease {
-                if now < held.expires_at {
-                    return Err(Status::failed_precondition(format!(
-                        "database is leased by {}",
-                        held.session
-                    )));
-                }
+            if let Some(held) = &db.lease
+                && now < held.expires_at
+            {
+                return Err(Status::failed_precondition(format!(
+                    "database is leased by {}",
+                    held.session
+                )));
             }
             db.lease = Some(Lease {
                 id: id.clone(),
@@ -127,10 +127,10 @@ impl Store {
     }
 
     pub fn close(&mut self, req: proto::CloseRequest) -> Result<proto::CloseResponse, Status> {
-        if let Some(db) = self.databases.get_mut(&req.database) {
-            if db.lease.as_ref().is_some_and(|l| l.id == req.lease) {
-                db.lease = None;
-            }
+        if let Some(db) = self.databases.get_mut(&req.database)
+            && db.lease.as_ref().is_some_and(|l| l.id == req.lease)
+        {
+            db.lease = None;
         }
         Ok(proto::CloseResponse {})
     }
@@ -490,7 +490,7 @@ impl VersionedFile {
         if size < old {
             // Zero the tail of the boundary chunk and drop whole chunks past
             // the new end, so a later extension reads zeros.
-            if size % CHUNK != 0 {
+            if !size.is_multiple_of(CHUNK) {
                 let index = size / CHUNK;
                 if let Some(c) = self.chunk_at(index, version) {
                     let mut chunk = c.to_vec();

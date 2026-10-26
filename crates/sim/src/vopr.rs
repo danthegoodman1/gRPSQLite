@@ -239,7 +239,10 @@ struct Sim {
     /// leaves the original draws unchanged.
     extra: Prng,
     backend: Arc<SimBackend>,
-    cache: Option<CacheSettings>,
+    cache_bytes: u64,
+    /// Clients created so far; each new client is a new machine with its
+    /// own cache disk.
+    machines: u64,
     writer: Client,
     conn: Option<Connection>,
     reader: Option<(Client, Option<Connection>)>,
@@ -267,10 +270,11 @@ pub fn run_with(seed: u64, cfg: SimConfig, verbose: bool) -> Result<Report, Stri
         cfg.faults.clone(),
         Prng::stream(seed, "faults"),
     ));
-    let cache = cfg.cache.clone().map(|faults| {
-        let max_bytes = *Prng::stream(seed, "cache-size").pick(&[64 * 1024, 1 << 20, 64 << 20]);
-        SimCacheStores::settings(faults, Prng::stream(seed, "cache"), max_bytes)
-    });
+    let cache_bytes = *Prng::stream(seed, "cache-size").pick(&[64 * 1024, 1 << 20, 64 << 20]);
+    let cache = cfg
+        .cache
+        .clone()
+        .map(|faults| SimCacheStores::settings(faults, Prng::stream(seed, "cache"), cache_bytes));
     if verbose {
         eprintln!("seed {seed}: {cfg:?}");
     }
@@ -281,7 +285,8 @@ pub fn run_with(seed: u64, cfg: SimConfig, verbose: bool) -> Result<Report, Stri
         extra: Prng::stream(seed, "workload-extra"),
         cfg,
         backend,
-        cache,
+        cache_bytes,
+        machines: 0,
         writer,
         conn: None,
         reader: None,
@@ -297,6 +302,16 @@ pub fn run_with(seed: u64, cfg: SimConfig, verbose: bool) -> Result<Report, Stri
 }
 
 impl Sim {
+    /// A cache disk for a new machine.
+    fn new_cache(&mut self) -> Option<CacheSettings> {
+        self.machines += 1;
+        let rng = Prng::stream(self.seed, &format!("cache-{}", self.machines));
+        self.cfg
+            .cache
+            .clone()
+            .map(|faults| SimCacheStores::settings(faults, rng, self.cache_bytes))
+    }
+
     fn fail(&self, msg: impl std::fmt::Display) -> String {
         format!("seed {} step {}: {msg}", self.seed, self.step)
     }
@@ -554,12 +569,12 @@ impl Sim {
         if digest == before {
             return Ok(());
         }
-        if let Some(after) = after {
-            if digest == digest_rows(&after) {
-                self.model = after;
-                self.history.insert(digest);
-                return Ok(());
-            }
+        if let Some(after) = after
+            && digest == digest_rows(&after)
+        {
+            self.model = after;
+            self.history.insert(digest);
+            return Ok(());
         }
         Err(self.fail("a failed transaction left a state that is neither before nor after it"))
     }
@@ -599,10 +614,10 @@ impl Sim {
             self.conn()
                 .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         });
-        if let Ok(msg) = result {
-            if msg != "ok" {
-                return Err(self.fail(format!("integrity_check: {msg}")));
-            }
+        if let Ok(msg) = result
+            && msg != "ok"
+        {
+            return Err(self.fail(format!("integrity_check: {msg}")));
         }
         Ok(())
     }
@@ -636,7 +651,7 @@ impl Sim {
     /// The replica's connection, opened on first use.
     fn reader_conn(&mut self) -> Option<&Connection> {
         if self.reader.is_none() {
-            let client = Client::new(self.backend.clone(), self.cache.clone());
+            let client = Client::new(self.backend.clone(), self.new_cache());
             self.reader = Some((client, None));
         }
         let (client, conn) = self.reader.as_mut()?;
@@ -666,7 +681,8 @@ impl Sim {
         if let (Ok(d), Some(c)) = (&first, &conn) {
             self.note("long-reader", *d);
             if !self.history.contains(d) {
-                result = Err(self.fail("a read-only transaction saw a state that was never committed"));
+                result =
+                    Err(self.fail("a read-only transaction saw a state that was never committed"));
             } else {
                 for _ in 0..self.extra.range(1..=3) {
                     self.transaction(false)?;
@@ -674,7 +690,8 @@ impl Sim {
                 if let Ok(again) = digest_db(c) {
                     self.report.reader_checks += 1;
                     if again != *d {
-                        result = Err(self.fail("a read-only transaction's view changed while it ran"));
+                        result =
+                            Err(self.fail("a read-only transaction's view changed while it ran"));
                     }
                 }
             }
@@ -693,10 +710,10 @@ impl Sim {
             return Ok(());
         };
         let result = digest_db(c);
-        if self.rng.percent(20) {
-            if let Some((_, conn)) = &mut self.reader {
-                *conn = None;
-            }
+        if self.rng.percent(20)
+            && let Some((_, conn)) = &mut self.reader
+        {
+            *conn = None;
         }
         if let Ok(d) = result {
             self.report.reader_checks += 1;
@@ -756,7 +773,7 @@ impl Sim {
     fn takeover(&mut self) -> Result<(), String> {
         self.backend.stall_heartbeats(DB);
         self.backend.advance(self.backend.lease_ttl() + 1);
-        let next = Client::new(self.backend.clone(), self.cache.clone());
+        let next = Client::new(self.backend.clone(), self.new_cache());
         let old = std::mem::replace(&mut self.writer, next);
         let old_conn = self.conn.take();
         self.open_writer()?;

@@ -10,14 +10,16 @@ publish = false
 name = "vopr"
 path = "src/bin/vopr.rs"
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 grpsqlite = { workspace = true, features = ["static"] }
 grpsqlite-memory.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 rusqlite.workspace = true
+tokio.workspace = true
 tonic.workspace = true
 xxhash-rust.workspace = true
-
-[dev-dependencies]
-tokio.workspace = true

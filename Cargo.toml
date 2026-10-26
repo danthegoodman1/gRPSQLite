@@ -1,33 +1,28 @@
-[package]
-name = "grpsqlite"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-tokio = { version = "1.45.1", features = ["full"] }
-tonic = "0.13.1"
-prost = "0.13.5"
-uuid = { version = "1.17.0", features = ["v4"] }
-log = { version = "0.4.27", features = ["std"] }
-
-[[example]]
-name = "memory_server"
-
-[[example]]
-name = "memory_server_no_atomic"
-
-[[example]]
-name = "versioned_memory_server"
-
-[[example]]
-name = "memory_server_with_checksums"
-
 [workspace]
 resolver = "3"
-members = ["sqlite_vfs"]
+members = ["crates/proto", "crates/vfs", "crates/memory", "crates/sim"]
+exclude = ["vendor/sqlite-plugin"]
 
-[build-dependencies]
-tonic-build = "0.13.1"
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
 
-[dev-dependencies]
-im = "15.1.0"
+[workspace.dependencies]
+bytes = "1"
+grpsqlite = { path = "crates/vfs" }
+grpsqlite-memory = { path = "crates/memory" }
+grpsqlite-proto = { path = "crates/proto" }
+log = { version = "0.4.34", features = ["std"] }
+parking_lot = "0.13"
+prost = "0.14"
+rusqlite = { version = "0.41", features = ["bundled"] }
+sqlite-plugin = { version = "0.11", default-features = false }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+
+[patch.crates-io]
+sqlite-plugin = { path = "vendor/sqlite-plugin" }

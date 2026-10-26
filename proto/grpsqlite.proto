@@ -1,0 +1,214 @@
+syntax = "proto3";
+package grpsqlite.v2;
+
+// A gRPSQLite server stores SQLite database files for clients running the
+// gRPSQLite VFS. Each database has at most one read-write client, which holds
+// the database's lease, and any number of read-only clients when the server
+// supports point-in-time reads.
+//
+// Errors use gRPC status codes:
+// - FAILED_PRECONDITION: the request's lease is missing, expired, or replaced.
+//   The client treats its lease as lost and stops writing.
+// - OUT_OF_RANGE: the requested version is no longer available.
+// - UNAVAILABLE, DEADLINE_EXCEEDED: transient failures. After either, the
+//   client cannot tell whether a write or commit took effect.
+// Any other code fails the SQLite operation that issued the request.
+service Grpsqlite {
+  // Open starts a session for one database. A read-write open acquires the
+  // database's lease and fails with FAILED_PRECONDITION while another session
+  // holds it. A read-only open requires point_in_time_reads and atomic_commit.
+  // The server creates the database on its first write.
+  rpc Open(OpenRequest) returns (OpenResponse);
+
+  // Close ends a session and releases its lease. Closing a session that holds
+  // no lease, or one the server has forgotten, succeeds.
+  rpc Close(CloseRequest) returns (CloseResponse);
+
+  // Heartbeat extends a session's lease by lease_ttl_millis. It fails with
+  // FAILED_PRECONDITION when the lease has expired or another session holds it.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // Read returns up to `length` bytes starting at `offset`. Return fewer bytes
+  // when the file ends sooner, and no bytes for a missing file; the client
+  // zero-fills the rest. A request carrying a lease reads the latest state and
+  // carries no version.
+  rpc Read(ReadRequest) returns (ReadResponse);
+
+  // Write stores bytes at an offset, extending the file with zeros if needed,
+  // and applies each request atomically. Only servers without atomic_commit
+  // receive Write, for all three file kinds.
+  rpc Write(WriteRequest) returns (WriteResponse);
+
+  // Commit applies a whole SQLite transaction to the main database file
+  // atomically: either every write and the truncation take effect, or none
+  // does. Only servers with atomic_commit receive Commit.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+
+  // GetFileSize returns the file's size, or 0 for a missing file.
+  rpc GetFileSize(GetFileSizeRequest) returns (GetFileSizeResponse);
+
+  // Truncate sets the file's size, discarding bytes past it or extending the
+  // file with zeros.
+  rpc Truncate(TruncateRequest) returns (TruncateResponse);
+
+  // Delete removes the file. Deleting a missing file succeeds.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Pragma runs a server-defined pragma. The client forwards only pragmas
+  // whose names start with `grpsqlite_`. Return NOT_FOUND for unknown names.
+  rpc Pragma(PragmaRequest) returns (PragmaResponse);
+}
+
+// The three files a database can have on the server. Servers with
+// atomic_commit only ever see FILE_KIND_MAIN; clients keep rollback journals
+// in memory because the server never holds a partial transaction.
+enum FileKind {
+  FILE_KIND_MAIN = 0;
+  // The rollback journal, `<database>-journal`.
+  FILE_KIND_JOURNAL = 1;
+  // The write-ahead log, `<database>-wal`.
+  FILE_KIND_WAL = 2;
+}
+
+// Names one file of one database within a session.
+message FileRef {
+  string session = 1;
+  // The session's lease. Empty for read-only sessions. Requests that change a
+  // file must carry the database's current lease.
+  string lease = 2;
+  // The database's path as the application opened it.
+  string database = 3;
+  FileKind kind = 4;
+}
+
+message OpenRequest {
+  // From the client's GRPSQLITE_CLIENT_TOKEN environment variable.
+  string client_token = 1;
+  string database = 2;
+  bool readonly = 3;
+}
+
+message OpenResponse {
+  string session = 1;
+  // The lease for a read-write open; empty for a read-only open.
+  string lease = 2;
+  // The server implements Commit.
+  bool atomic_commit = 3;
+  // The server returns a version with every read and can read at a version.
+  bool point_in_time_reads = 4;
+  // The sector size SQLite should assume. 0 means 4096.
+  uint32 sector_size = 5;
+  // How often the client heartbeats its lease. 0 means 5000.
+  uint64 heartbeat_interval_millis = 6;
+  // How long a lease lasts after each Open or Heartbeat. The client stops
+  // using a lease that many milliseconds after it sent the last heartbeat the
+  // server accepted. 0 means three heartbeat intervals.
+  uint64 lease_ttl_millis = 7;
+}
+
+message CloseRequest {
+  string session = 1;
+  string lease = 2;
+  string database = 3;
+}
+
+message CloseResponse {}
+
+message HeartbeatRequest {
+  string session = 1;
+  string lease = 2;
+  string database = 3;
+}
+
+message HeartbeatResponse {}
+
+message ReadRequest {
+  FileRef file = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  // The version to read at, from an earlier response in the same read-only
+  // transaction. Empty means the latest version.
+  bytes version = 4;
+  // The XXH3-64 checksum of the client's cached copy of exactly these bytes,
+  // or 0 when the client has none.
+  uint64 checksum = 5;
+}
+
+message ReadResponse {
+  // The bytes read. Empty when checksum_matched is set.
+  bytes data = 1;
+  // The version the server read at, for servers with point_in_time_reads.
+  // Opaque to the client, which sends it back to read the same version.
+  bytes version = 2;
+  // The requested bytes hash to the request's checksum, so the client may
+  // use its cached copy. Servers may always leave this unset.
+  bool checksum_matched = 3;
+}
+
+message WriteRequest {
+  FileRef file = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  // The XXH3-64 checksum of `data`.
+  uint64 checksum = 4;
+}
+
+message WriteResponse {}
+
+message PageWrite {
+  uint64 offset = 1;
+  bytes data = 2;
+  // The XXH3-64 checksum of `data`.
+  uint64 checksum = 3;
+}
+
+message CommitRequest {
+  // Always FILE_KIND_MAIN.
+  FileRef file = 1;
+  // Non-overlapping writes in ascending offset order.
+  repeated PageWrite writes = 2;
+  // When set, truncate or extend the file to this size before applying the
+  // writes.
+  optional uint64 truncate_to = 3;
+}
+
+message CommitResponse {
+  // The version that contains this commit, for servers with
+  // point_in_time_reads.
+  bytes version = 1;
+}
+
+message GetFileSizeRequest {
+  FileRef file = 1;
+  // As in ReadRequest.
+  bytes version = 2;
+}
+
+message GetFileSizeResponse {
+  uint64 size = 1;
+  // As in ReadResponse.
+  bytes version = 2;
+}
+
+message TruncateRequest {
+  FileRef file = 1;
+  uint64 size = 2;
+}
+
+message TruncateResponse {}
+
+message DeleteRequest { FileRef file = 1; }
+
+message DeleteResponse {}
+
+message PragmaRequest {
+  FileRef file = 1;
+  string name = 2;
+  // Empty when the pragma has no argument.
+  string value = 3;
+}
+
+message PragmaResponse {
+  // Returned to SQLite as the pragma's result row. Empty means no result.
+  string response = 1;
+}

@@ -1,0 +1,307 @@
+//! The bugs found in the review of `e2a2d84` (R1–R11 in `PLAN.md`), each
+//! replayed against the simulated server.
+
+use std::sync::Arc;
+
+use grpsqlite::EnvConfig;
+use grpsqlite_memory::Options;
+use grpsqlite_sim::backend::SimBackend;
+use grpsqlite_sim::cache::{CacheFaults, SimCacheStores};
+use grpsqlite_sim::harness::{Client, sqlite_code};
+use grpsqlite_sim::prng::Prng;
+use rusqlite::{Connection, ErrorCode};
+
+fn atomic() -> Options {
+    Options::default()
+}
+
+fn non_atomic() -> Options {
+    Options {
+        atomic_commit: false,
+        point_in_time_reads: false,
+        ..Options::default()
+    }
+}
+
+fn setup(opts: Options) -> (Arc<SimBackend>, Client) {
+    let backend = Arc::new(SimBackend::simple(opts));
+    let client = Client::new(backend.clone(), None);
+    (backend, client)
+}
+
+fn count(conn: &Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).expect(sql)
+}
+
+fn integrity(conn: &Connection) -> String {
+    conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .expect("integrity_check")
+}
+
+/// Crashes the client: every request fails, so dropping the connection
+/// releases nothing on the server; then waits out the lease.
+fn crash(backend: &SimBackend, conn: Connection) {
+    backend.partition_after(0);
+    drop(conn);
+    backend.heal();
+    backend.advance(backend.lease_ttl() + 1);
+}
+
+const FILL: &str = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b);
+    WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x < 5000)
+    INSERT INTO t1 SELECT x, 'old' || printf('%097d', x) FROM s;";
+
+#[test]
+fn r1_crash_before_commit_leaves_no_trace() {
+    let (backend, client) = setup(atomic());
+    let conn = client.open("r1.db").unwrap();
+    conn.execute_batch("PRAGMA journal_mode=memory; PRAGMA cache_size=10;")
+        .unwrap();
+    conn.execute_batch(FILL).unwrap();
+    conn.execute_batch("BEGIN; UPDATE t1 SET b = 'new' || printf('%097d', a);")
+        .unwrap();
+    assert_eq!(
+        backend.count("write.main"),
+        0,
+        "nothing reaches the server before COMMIT"
+    );
+    crash(&backend, conn);
+    let conn = client.open("r1.db").unwrap();
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM t1 WHERE b LIKE 'new%'"),
+        0
+    );
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM t1 WHERE b LIKE 'old%'"),
+        5000
+    );
+    assert_eq!(integrity(&conn), "ok");
+}
+
+#[test]
+fn r2_spilled_pages_commit_atomically() {
+    let (backend, client) = setup(atomic());
+    let conn = client.open("r2.db").unwrap();
+    conn.execute_batch("PRAGMA journal_mode=memory; PRAGMA cache_size=10; CREATE TABLE t1(a, b);")
+        .unwrap();
+    backend.reset_counts();
+    conn.execute_batch(
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x < 20000)
+         INSERT INTO t1 SELECT x, printf('%0100d', x) FROM s;",
+    )
+    .unwrap();
+    assert_eq!(backend.count("write.main"), 0);
+    assert_eq!(backend.count("commit"), 1, "one transaction, one commit");
+    assert_eq!(count(&conn, "SELECT count(*) FROM t1"), 20000);
+}
+
+#[test]
+fn r3_crash_mid_transaction_rolls_back_from_the_journal() {
+    let (backend, client) = setup(non_atomic());
+    let conn = client.open("r3.db").unwrap();
+    conn.execute_batch("PRAGMA journal_mode=delete;").unwrap();
+    conn.execute_batch(FILL).unwrap();
+    backend.reset_counts();
+    conn.execute_batch(
+        "PRAGMA cache_size=10; BEGIN;
+         DELETE FROM t1 WHERE a % 2 = 0;
+         INSERT INTO t1 SELECT a + 100000, printf('%0300d', a) FROM t1;",
+    )
+    .unwrap();
+    assert!(
+        backend.count("write.main") > 0,
+        "spilled pages reached the server"
+    );
+    crash(&backend, conn);
+    let conn = client.open("r3.db").unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM t1"), 5000);
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM t1 WHERE b LIKE 'old%'"),
+        5000
+    );
+    assert_eq!(integrity(&conn), "ok");
+}
+
+#[test]
+fn r4_every_page_size_works() {
+    for opts in [atomic(), non_atomic()] {
+        for page_size in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            let (_backend, client) = setup(opts.clone());
+            let path = format!("r4-{page_size}.db");
+            let conn = client.open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "PRAGMA page_size={page_size}; CREATE TABLE t1(a, b);
+                 WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x < 2000)
+                 INSERT INTO t1 SELECT x, printf('%050d', x) FROM s;"
+            ))
+            .unwrap();
+            assert_eq!(count(&conn, "PRAGMA page_size"), page_size);
+            drop(conn);
+            let conn = client.open(&path).unwrap();
+            assert_eq!(
+                count(&conn, "SELECT count(*) FROM t1"),
+                2000,
+                "page size {page_size}"
+            );
+            assert_eq!(integrity(&conn), "ok", "page size {page_size}");
+        }
+    }
+}
+
+#[test]
+fn r5_reopening_another_database_keeps_them_apart() {
+    let (_backend, client) = setup(atomic());
+    let b = client.open("b.db").unwrap();
+    b.execute_batch("CREATE TABLE b_tbl(y); INSERT INTO b_tbl VALUES (10);")
+        .unwrap();
+    drop(b);
+    let a = client.open("a.db").unwrap();
+    a.execute_batch(
+        "CREATE TABLE a_tbl(x); CREATE TABLE a_tbl2(x); INSERT INTO a_tbl VALUES (1), (2), (3);",
+    )
+    .unwrap();
+    drop(a);
+    let b = client.open("b.db").unwrap();
+    let names: Vec<String> = b
+        .prepare("SELECT name FROM sqlite_schema")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(names, ["b_tbl"]);
+    assert_eq!(count(&b, "SELECT y FROM b_tbl"), 10);
+    // Both open at once, through ATTACH.
+    b.execute_batch(
+        "ATTACH 'a.db' AS a; INSERT INTO a.a_tbl VALUES (4); INSERT INTO b_tbl VALUES (11);",
+    )
+    .unwrap();
+    assert_eq!(count(&b, "SELECT count(*) FROM a.a_tbl"), 4);
+    assert_eq!(count(&b, "SELECT count(*) FROM b_tbl"), 2);
+    assert_eq!(integrity(&b), "ok");
+}
+
+#[test]
+fn r6_writer_reads_its_latest_commit() {
+    let (backend, client) = setup(atomic());
+    let conn = client.open("r6.db").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t1(a, b);
+         WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x < 1000)
+         INSERT INTO t1 SELECT x, printf('%0100d', x) FROM s;",
+    )
+    .unwrap();
+    drop(conn);
+    let conn = client.open("r6.db").unwrap();
+    conn.execute_batch("PRAGMA cache_size=10;").unwrap();
+    for _ in 0..2 {
+        backend.advance(1000);
+        conn.execute_batch(
+            "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x < 3000)
+             INSERT INTO t1 SELECT x, printf('%0100d', x) FROM s;",
+        )
+        .unwrap();
+    }
+    assert_eq!(count(&conn, "SELECT count(*) FROM t1"), 7000);
+    assert_eq!(integrity(&conn), "ok");
+}
+
+#[test]
+fn r6_exclusive_locking_is_rejected_with_atomic_commits() {
+    let (_backend, client) = setup(atomic());
+    let conn = client.open("r6x.db").unwrap();
+    let err = conn
+        .execute_batch("PRAGMA locking_mode=exclusive")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("locking_mode=exclusive is unsupported"),
+        "{err}"
+    );
+}
+
+#[test]
+fn r7_temporary_files_stay_local() {
+    let (backend, client) = setup(atomic());
+    let conn = client.open("r7.db").unwrap();
+    conn.execute_batch(
+        "PRAGMA cache_size=10; CREATE TABLE t1(a, b);
+         WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x < 50000)
+         INSERT INTO t1 SELECT x, printf('%050d', x * 7919 % 50000) FROM s;",
+    )
+    .unwrap();
+    backend.reset_counts();
+    conn.execute_batch("CREATE INDEX t1b ON t1(b); VACUUM;")
+        .unwrap();
+    let counts = backend.counts();
+    for name in counts.keys() {
+        assert!(
+            ["commit", "read.main", "size.main", "heartbeat"].contains(&name.as_str()),
+            "unexpected request {name}: {counts:?}"
+        );
+    }
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM t1 INDEXED BY t1b WHERE b > ''"),
+        50000
+    );
+}
+
+#[test]
+fn r8_paths_name_distinct_databases() {
+    let (_backend, client) = setup(atomic());
+    for (path, rows) in [("/tmp/abs/main.db", 1), ("/a/x.db", 2), ("/b/x.db", 3)] {
+        let conn = client.open(path).unwrap();
+        conn.execute_batch("CREATE TABLE t(x)").unwrap();
+        for i in 0..rows {
+            conn.execute("INSERT INTO t VALUES (?1)", [i]).unwrap();
+        }
+    }
+    for (path, rows) in [("/tmp/abs/main.db", 1), ("/a/x.db", 2), ("/b/x.db", 3)] {
+        let conn = client.open(path).unwrap();
+        assert_eq!(count(&conn, "SELECT count(*) FROM t"), rows, "{path}");
+    }
+}
+
+#[test]
+fn r9_cache_settings_are_validated_not_panicked_on() {
+    let half = EnvConfig::from_lookup(|name| {
+        (name == "GRPSQLITE_CACHE_DIR").then(|| "/tmp/c".to_string())
+    });
+    let err = half.unwrap_err();
+    assert!(err.contains("together"), "{err}");
+    // A VFS built from a bad configuration fails each open instead.
+    let backend = Arc::new(SimBackend::simple(atomic()));
+    let client = Client::with_config(backend, Err(err), None);
+    let err = client.open("r9.db").unwrap_err();
+    assert_eq!(sqlite_code(&err), Some(ErrorCode::CannotOpen));
+}
+
+#[test]
+fn r10_cached_pages_follow_commits() {
+    let backend = Arc::new(SimBackend::simple(atomic()));
+    let cache = SimCacheStores::settings(CacheFaults::default(), Prng::new(1), 64 << 20);
+    let client = Client::new(backend.clone(), Some(cache));
+    let conn = client.open("r10.db").unwrap();
+    conn.execute_batch(
+        "PRAGMA cache_size=10; CREATE TABLE t1(a INTEGER PRIMARY KEY, b);
+         WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x < 3000)
+         INSERT INTO t1 SELECT x, 'old' || printf('%097d', x) FROM s;",
+    )
+    .unwrap();
+    conn.execute_batch("UPDATE t1 SET b = 'new' || printf('%097d', a) WHERE a % 3 = 0;")
+        .unwrap();
+    backend.reset_counts();
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM t1 WHERE b LIKE 'new%'"),
+        1000
+    );
+    assert_eq!(
+        count(&conn, "SELECT count(*) FROM t1 WHERE b LIKE 'old%'"),
+        2000
+    );
+    assert_eq!(
+        backend.count("read.main"),
+        0,
+        "the lease holder reads cached pages locally"
+    );
+}

@@ -1,0 +1,19 @@
+[package]
+name = "grpsqlite-memory"
+description = "An in-memory gRPSQLite server: the reference implementation of the protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "memory-server"
+path = "src/main.rs"
+
+[dependencies]
+bytes.workspace = true
+grpsqlite-proto.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+xxhash-rust.workspace = true

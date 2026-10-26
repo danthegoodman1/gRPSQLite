@@ -1,0 +1,16 @@
+[package]
+name = "grpsqlite-proto"
+description = "Generated gRPC types for the gRPSQLite protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protox = "0.10"
+tonic-prost-build = "0.14"

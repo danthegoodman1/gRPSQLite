@@ -116,7 +116,7 @@ Status ledger:
 | Complete | Work | 2E VOPR | `crates/sim/src/vopr.rs`, `crates/sim/src/bin/vopr.rs`. |
 | In Progress | Work | 2F CI workflow | `.github/workflows/ci.yml`. Needs: a passing run on the pull request. |
 | Complete | Decision | Gate: detection shown by observations and planted bugs | The harness drives only the new VFS, so the repros cannot run against `e2a2d84`'s. Each was observed failing there (above), and `scripts/mutants` reintroduces the bug classes. |
-| Complete | Gate | Repros cover R1–R11; planted bugs caught; seeds replay | `cargo test --workspace` passes; `seeds::a_seed_replays_exactly`; `scripts/mutants` at `60ecd07` caught all 9. |
+| Complete | Gate | Repros cover R1–R11; planted bugs caught; seeds replay | `cargo test --workspace` passes; `seeds::a_seed_replays_exactly`; `scripts/mutants` at `52d3cc0` caught all 9. |
 
 ## Phase 3: Per-Database State and Atomic Transactions
 
@@ -148,11 +148,11 @@ Status ledger:
 | Complete | Work | 3C VFS-owned transaction batch | `crates/vfs/src/overlay.rs` with randomized model tests; R1 and R2 pass. |
 | Complete | Decision | `locking_mode=exclusive` in atomic mode | Rejected. Seed 38 showed that an exclusive writer stops bumping the change counter, so replicas mixed versions. `r6_exclusive_locking_is_rejected_with_atomic_commits`; mutant `exclusive-locking-allowed` caught at seed 39. |
 | Complete | Work | 3D Per-database header cache using the header's page size | `DbState::written` and `truncated`; R4 and R5 pass; mutant `stale-state-after-commit` caught at seed 8. |
-| Complete | Work | 3E Latest reads for read-write, pinned versions for read-only | `MainFile::snapshot`; R6 passes; mutant `replica-reads-latest` caught at seed 10. |
+| Complete | Work | 3E Latest reads for read-write, pinned versions for read-only | `MainFile::snapshot`; R6 passes; mutant `replica-reads-latest` caught at seed 11. |
 | Complete | Work | 3F Server-backed `access()` and `check_reserved_lock` | R3 passes; mutant `journal-exists-locally-only` caught at seed 0. |
 | Complete | Work | 3G Remove redundant state and batch clone | `Overlay::into_commit_parts` moves `Bytes` into the request. |
-| Complete | Test | Cross-database transactions | `Sim::cross_database` in `crates/sim/src/vopr.rs`: 100,000 seeds ran 451,283, of which 2,924 failed commits reached one database and not the other; each database matched its own model. |
-| Complete | Gate | R1–R7 pass; 100,000-seed VOPR sweep clean | `cargo test --workspace`; `vopr 0 --seeds 100000` at `60ecd07`: 11,989,070 steps, 7,688,788 commits, no failures, 2 min 41 s. |
+| Complete | Test | Cross-database transactions | `Sim::cross_database` in `crates/sim/src/vopr.rs`: 100,000 seeds at `52d3cc0` ran 451,290, and 2,930 failed commits reached one database and not the other; each database matched its own model. |
+| Complete | Gate | R1–R7 pass; 100,000-seed VOPR sweep clean | `cargo test --workspace`; `vopr 0 --seeds 100000` at `52d3cc0`: 11,989,070 steps, 7,689,096 commits, 144,302 ambiguous commits, 495,322 crashes, 107,038 takeovers, no failures, 2 min 42 s. |
 
 ## Phase 4: Protocol v2
 
@@ -187,7 +187,7 @@ Status ledger:
 | Complete | Work | 4E Prefixed pragma forwarding | `Core::pragma` forwards only `grpsqlite_*`; `e2e::persists_across_connections_and_clients` reads `PRAGMA grpsqlite_server`. |
 | Complete | Doc | 4F Proto and README corrections | `proto/grpsqlite.proto` header and RPC comments; README "Writing a server". |
 | Complete | Work | 4G Reference server with lease checks | `crates/memory/src/lib.rs`; `stale_lease_cannot_write`, `reads_at_old_versions`, `truncate_then_extend_reads_zeros`. |
-| Complete | Gate | Memory server, harness and VOPR pass on v2 | `cargo test --workspace`; `scripts/smoke`; 100,000-seed sweep at `60ecd07`. |
+| Complete | Gate | Memory server, harness and VOPR pass on v2 | `cargo test --workspace`; `scripts/smoke`; 100,000-seed sweep at `52d3cc0`. |
 
 ## Phase 5: Leases, Runtime and Failure Handling
 
@@ -220,7 +220,7 @@ Status ledger:
 | Complete | Work | 5D Close and delete error paths | Seed 303 regression in `crates/sim/tests/seeds.rs`. |
 | Complete | Test | 5E VOPR fault profiles and properties | `Faults` and `SimBackend::partition_after`, `lose_response_of`; `crash`, `takeover`, `resolve` in `crates/sim/src/vopr.rs`; regressions 67,294 and 1,000,316 (an integrity check meeting a lapsed lease). |
 | Complete | Test | 5E Liveness | A step that sends over 200,000 requests fails its seed; the peak across 100,000 seeds was 26,122. Mutant `stale-state-after-commit` had made SQLite loop forever in `btreeBeginTrans`. |
-| Complete | Test | 5F Planted bugs | `scripts/mutants` at `60ecd07`: all 9 caught (commit-every-write seed 5, journal-exists-locally-only 0, stale-state-after-commit 8, failed-commit-reported-ok 20, lease-loss-ignored 14, replica-reads-latest 10, exclusive-locking-allowed 39, changed-pages-ignored 18, cache-skips-checksum 25). |
+| Complete | Test | 5F Planted bugs | `scripts/mutants` at `52d3cc0`: all 9 caught (commit-every-write seed 11, journal-exists-locally-only 0, stale-state-after-commit 8, failed-commit-reported-ok 14, lease-loss-ignored 14, replica-reads-latest 11, exclusive-locking-allowed 39, changed-pages-ignored 25, cache-skips-checksum 25). |
 | Complete | Gate | 100,000 seeds clean; every mutant caught | Sweep and mutants above. |
 
 ## Phase 6: Local Page Cache
@@ -284,9 +284,9 @@ Status ledger:
 | Complete | Work | 7B Cache reuse across restarts | `Manifest` in `crates/vfs/src/cache.rs`; a reopened writer's full scan takes 3 requests instead of 36. |
 | Complete | Work | 7C Read-ahead on sequential scans | `MainFile::fetch_len` doubles to 1 MiB. Full scan 1,056 → 36 requests; 50 range scans 2,662 → 398. |
 | Complete | Work | 7C File size in read responses | `ReadResponse.size`: replica 500 lookups 1,478 → 978 requests. |
-| Complete | Work | 7C Bulk validation with `ChangedPages` | `PageCache::advance_to`, `Core::pin`. Cached replica: 500 lookups 978 → 500, range scans 448 → 50, full scan 37 → 1, lookups under 50 commits 1,245 → 619. Mutant `changed-pages-ignored` caught at seed 18; `e2e::a_cached_replica_follows_commits`. |
+| Complete | Work | 7C Bulk validation with `ChangedPages` | `PageCache::advance_to`, `Core::pin`. Cached replica: 500 lookups 978 → 500, range scans 448 → 50, full scan 37 → 1, lookups under 50 commits 1,245 → 619. Mutant `changed-pages-ignored` caught at seed 25; `e2e::a_cached_replica_follows_commits`. |
 | Complete | Decision | 7C Adopt both | Read-ahead serves uncached scans; bulk validation serves cached replicas. Without `ChangedPages`, a cached replica sends as many requests as an uncached one. |
-| Complete | Gate | Recorded wins; VOPR clean | Rows above; 100,000-seed sweep at `60ecd07`. |
+| Complete | Gate | Recorded wins; VOPR clean | Rows above; 100,000-seed sweep at `52d3cc0`. |
 
 ## Review
 

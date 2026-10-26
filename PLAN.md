@@ -114,7 +114,7 @@ Status ledger:
 | Complete | Test | R10 `LOCAL_READS=true` serves stale pages | `r10_cached_pages_follow_commits`. Observed: 925 of 1,000 updated rows visible. |
 | Complete | Test | R11 No server at startup | `e2e::r11_no_server_fails_the_open`. Observed: panic in the load-time constructor, exit 134. |
 | Complete | Work | 2E VOPR | `crates/sim/src/vopr.rs`, `crates/sim/src/bin/vopr.rs`. |
-| In Progress | Work | 2F CI workflow | `.github/workflows/ci.yml`. Needs: a passing run on the pull request. |
+| Complete | Work | 2F CI workflow | `.github/workflows/ci.yml` installs libclang for the plugin's bindgen build. Run 40263639188 on PR #15 passed both jobs; its VOPR job ran 2,000 seeds from 55,776,306,578,879,360. |
 | Complete | Decision | Gate: detection shown by observations and planted bugs | The harness drives only the new VFS, so the repros cannot run against `e2a2d84`'s. Each was observed failing there (above), and `scripts/mutants` reintroduces the bug classes. |
 | Complete | Gate | Repros cover R1–R11; planted bugs caught; seeds replay | `cargo test --workspace` passes; `seeds::a_seed_replays_exactly`; `scripts/mutants` at `52d3cc0` caught all 9. |
 

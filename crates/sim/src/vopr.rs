@@ -629,19 +629,21 @@ impl Sim {
     /// adopts whichever acceptable state it holds.
     fn resolve(&mut self, after: Option<Rows>) -> Result<(), String> {
         let digest = self.quiet_digest()?;
-        let before = digest_rows(&self.model);
         self.note("resolve", digest);
-        if digest == before {
-            return Ok(());
-        }
-        if let Some(after) = after
-            && digest == digest_rows(&after)
-        {
-            self.model = after;
-            self.history.insert(digest);
-            return Ok(());
-        }
-        Err(self.fail("a failed transaction left a state that is neither before nor after it"))
+        let (outcome, after) = match after {
+            Some(after) => (Outcome::CommitFailed, after),
+            None => (Outcome::Failed, self.model.clone()),
+        };
+        self.model = self.settle(
+            "a failed transaction",
+            outcome,
+            digest,
+            &self.model,
+            after,
+            DB,
+        )?;
+        self.history.insert(digest);
+        Ok(())
     }
 
     /// The writer's digest with faults off. A writer that lost its lease is
@@ -835,21 +837,8 @@ impl Sim {
         self.report.crashes += 1;
         self.open_writer()?;
         let digest = self.quiet_digest()?;
-        let after_digest = digest_rows(&state);
-        let acceptable = match outcome {
-            Outcome::Committed => digest == after_digest,
-            Outcome::RolledBack | Outcome::Failed => digest == digest_rows(&self.model),
-            Outcome::CommitFailed => digest == after_digest || digest == digest_rows(&self.model),
-        };
-        if !acceptable {
-            return Err(self.fail(format!(
-                "after a crash ({outcome:?}) the database holds an unexpected state"
-            )));
-        }
-        if digest == after_digest && outcome != Outcome::RolledBack && outcome != Outcome::Failed {
-            self.model = state;
-            self.history.insert(digest);
-        }
+        self.model = self.settle("a crash", outcome, digest, &self.model, state, DB)?;
+        self.history.insert(digest);
         if outcome == Outcome::Committed {
             self.report.commits += 1;
         }
@@ -948,10 +937,25 @@ impl Sim {
         };
         self.note("cross-database", outcome as u64);
         self.report.cross_database += 1;
+        match outcome {
+            Outcome::Failed => self.report.failed_transactions += 1,
+            Outcome::CommitFailed => {
+                self.report.failed_transactions += 1;
+                self.report.ambiguous_commits += 1;
+            }
+            Outcome::Committed | Outcome::RolledBack => {}
+        }
         if crash {
             self.conn = None;
+            if let Some((_, conn)) = &mut self.reader {
+                *conn = None;
+            }
             self.backend.heal();
+            if !self.writer.core.is_idle() {
+                return Err(self.fail("the writer's VFS holds state after a crash"));
+            }
             self.backend.advance(self.backend.lease_ttl() + 1);
+            self.report.crashes += 1;
             self.open_writer()?;
         } else if backend
             .quietly(|| self.conn().execute_batch("DETACH b"))
@@ -962,11 +966,12 @@ impl Sim {
         let both_write = after_a != self.model && after_b != self.model_b;
         let digest = self.quiet_digest()?;
         let changed_a = digest != digest_rows(&self.model);
-        self.model = self.settle(outcome, digest, &self.model, after_a, DB)?;
+        let context = "a cross-database transaction";
+        self.model = self.settle(context, outcome, digest, &self.model, after_a, DB)?;
         self.history.insert(digest);
         let digest_b = self.digest_b()?;
         let changed_b = digest_b != digest_rows(&self.model_b);
-        self.model_b = self.settle(outcome, digest_b, &self.model_b, after_b, DB_B)?;
+        self.model_b = self.settle(context, outcome, digest_b, &self.model_b, after_b, DB_B)?;
         if both_write && changed_a != changed_b {
             self.report.split_commits += 1;
         }
@@ -976,11 +981,12 @@ impl Sim {
         Ok(())
     }
 
-    /// The state a database holds after a transaction with `outcome`:
-    /// `after` once it committed, `before` if COMMIT never ran, either one
-    /// if COMMIT failed.
+    /// The state a database holds after `context` ended a transaction with
+    /// `outcome`: `after` once it committed, `before` if it never committed,
+    /// either one if COMMIT failed.
     fn settle(
         &self,
+        context: &str,
         outcome: Outcome,
         digest: u64,
         before: &Rows,
@@ -995,7 +1001,7 @@ impl Sim {
                 Ok(before.clone())
             }
             _ => Err(self.fail(format!(
-                "after a cross-database transaction ({outcome:?}) {name} holds an unexpected state"
+                "after {context} ({outcome:?}) {name} holds an unexpected state"
             ))),
         }
     }

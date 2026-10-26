@@ -1,0 +1,29 @@
+--- a/src/vfs.rs
++++ b/src/vfs.rs
+@@ -142,6 +142,11 @@
+ pub trait Vfs: Send + Sync {
+     type Handle: VfsHandle;
+ 
++    /// Whether this VFS implements shared memory. When false, `SQLite` sees
++    /// no `xShm*` methods, so it refuses WAL outside exclusive locking mode
++    /// and fails to open a WAL database in normal locking mode.
++    const SHARED_MEMORY: bool = true;
++
+     /// construct a canonical version of the given path
+     fn canonical_path<'a>(&self, path: Cow<'a, str>) -> VfsResult<Cow<'a, str>> {
+         Ok(path)
+@@ -389,10 +394,10 @@
+         xFileControl: Some(x_file_control::<T>),
+         xSectorSize: Some(x_sector_size::<T>),
+         xDeviceCharacteristics: Some(x_device_characteristics::<T>),
+-        xShmMap: Some(x_shm_map::<T>),
+-        xShmLock: Some(x_shm_lock::<T>),
+-        xShmBarrier: Some(x_shm_barrier::<T>),
+-        xShmUnmap: Some(x_shm_unmap::<T>),
++        xShmMap: if T::SHARED_MEMORY { Some(x_shm_map::<T>) } else { None },
++        xShmLock: if T::SHARED_MEMORY { Some(x_shm_lock::<T>) } else { None },
++        xShmBarrier: if T::SHARED_MEMORY { Some(x_shm_barrier::<T>) } else { None },
++        xShmUnmap: if T::SHARED_MEMORY { Some(x_shm_unmap::<T>) } else { None },
+         xFetch: Some(x_fetch::<T>),
+         xUnfetch: Some(x_unfetch::<T>),
+     };

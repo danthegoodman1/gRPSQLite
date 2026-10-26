@@ -43,7 +43,7 @@ Goal:
 Current dependencies, a local Linux build against SQLite 3.54.1 with no protoc or Docker, and a VFS that never aborts its host.
 
 Scope:
-- 1A Replace the vendored `sqlite-plugin` 0.3.0 with 0.11.0, which zero-fills short reads and returns `SQLITE_IOERR_SHORT_READ`, sets `pMethods` to NULL on a failed open, adds `check_reserved_lock`, makes `sector_size` and `device_characteristics` per handle, and stops bundling rusqlite under `static`. Its `file_control` hook and an `unregister_static` call ride as local patches in `vendor/sqlite-plugin`. Implement `lock`, `unlock` and `check_reserved_lock`.
+- 1A Replace the vendored `sqlite-plugin` 0.3.0 with 0.11.0, which zero-fills short reads and returns `SQLITE_IOERR_SHORT_READ`, sets `pMethods` to NULL on a failed open, adds `check_reserved_lock`, makes `sector_size` and `device_characteristics` per handle, and stops bundling rusqlite under `static`. A `file_control` hook, an `unregister_static` call and a way to register no shared memory ride as local patches in `vendor/sqlite-plugin`. Implement `lock`, `unlock` and `check_reserved_lock`.
 - 1B Bump tonic 0.14, prost 0.14, tokio 1.54, xxhash-rust 0.8.19, parking_lot 0.13, log 0.4.34, rusqlite 0.41. Compile the proto with `protox` in a `grpsqlite-proto` crate, so builds need no system protoc.
 - 1C `scripts/build-sqlite` downloads the SQLite 3.54.1 amalgamation, checks its SHA3-256, and builds `target/sqlite/sqlite3-grpsqlite`, registering the VFS through `-DSQLITE_EXTRA_INIT`, plus a stock shell and `libgrpsqlite.so`.
 - 1D Name the VFS library `grpsqlite` so `.load libgrpsqlite` finds `sqlite3_grpsqlite_init`, and wire the crate's `static` and `dynamic` features to the plugin's.
@@ -64,8 +64,8 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Decision | Keep `sqlite-plugin` as the VFS framework | Review 2026-10-25: 0.11.0 offers a central `Vfs` trait, static and dynamic registration and a pragma hook, and graft-sqlite uses it. `rsqlite-vfs` 0.2.0 handles only `SIZE_HINT` in `xFileControl` and has no pragma hook; `sqlite-vfs` was last released 2022-07-08. |
-| Complete | Work | 1A `sqlite-plugin` 0.11.0 with local patches | `Cargo.toml` `[patch.crates-io]`; `vendor/sqlite-plugin/PATCHES.md`, `file_control.patch`, `unregister.patch`; `lock`, `unlock`, `check_reserved_lock` in `crates/vfs/src/vfs.rs` over `crates/vfs/src/locks.rs`. |
-| Blocked | Work | 1A Upstream the two plugin patches | Blocked by: the user's approval to open a PR on orbitinghail/sqlite-plugin, an outward-facing action. Both patches are ready as diffs against 0.11.0. |
+| Complete | Work | 1A `sqlite-plugin` 0.11.0 with local patches | `Cargo.toml` `[patch.crates-io]`; `vendor/sqlite-plugin/PATCHES.md`, `file_control.patch`, `unregister.patch`, `shared_memory.patch`; `lock`, `unlock`, `check_reserved_lock` in `crates/vfs/src/vfs.rs` over `crates/vfs/src/locks.rs`. |
+| Blocked | Work | 1A Upstream the three plugin patches | Blocked by: the user's approval to open a PR on orbitinghail/sqlite-plugin, an outward-facing action. `file_control.patch`, `unregister.patch` and `shared_memory.patch` are ready. |
 | Complete | Work | 1B Dependency bumps and `protox` | `Cargo.toml` workspace dependencies; `crates/proto/build.rs` compiles with `protox` and `tonic_prost_build`; no protoc on this machine. |
 | Complete | Decision | Drop TinyUFO and uuid | TinyUFO hashes with `ahash::RandomState::new`, which breaks seed replay; `PageCache` uses a deterministic LRU (`crates/vfs/src/cache.rs`). Session and lease ids are counters (`crates/memory/src/lib.rs`). |
 | Complete | Work | 1C `scripts/build-sqlite` with 3.54.1 and `SQLITE_EXTRA_INIT` | `scripts/build-sqlite` prints `built ... (SQLite 3.54.1)`; the README quick start ran without configure warnings on 2026-10-25. |
@@ -294,5 +294,13 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| In Progress | Test | `/code-review` of the branch | Missing: findings and their resolution. |
+| Complete | Test | `/code-review` of the branch | Ten findings at `8871ae3`, each confirmed and fixed in the rows below. |
+| Complete | Work | Open and close run under a per-database gate | Findings: a close racing an open of the same database released the lease the new handle used, and `dbs` stayed locked across `Open` and `Close` RPCs, stalling every other database. `Core::gated` serializes one database's open and close; `dbs` is held only for lookups. |
+| Complete | Work | Journals belong to their session | Findings: the process-wide journal map let a reopened database see a broken session's journal, and a closing broken session cleared its replacement's journals. Worse, the new session played that stale journal back over another writer's commit. `DbState::journals`; `a_reopened_database_ignores_the_broken_connection_journal` reads 0 of 500 committed rows against the shared map and passes now. |
+| Complete | Work | Reopening after a lapsed lease starts a session | Found by the test above: `open_main` reused a `Db` whose lease had lapsed but was not yet marked broken. |
+| Complete | Work | Replicas ignore a writer's live journal | Finding: a replica in the writer's process saw its in-memory journal as hot and failed with `SQLITE_READONLY_ROLLBACK`. `check_reserved_lock` answers yes for read-only handles; `a_replica_ignores_a_live_writer_journal_in_its_process`. |
+| Complete | Work | No shared memory | Finding: 0.11.0 always registers `xShm*`, so `PRAGMA journal_mode=wal` succeeded in normal locking mode and every later read failed. `Vfs::SHARED_MEMORY` (`shared_memory.patch`); `wal_needs_exclusive_locking`. |
+| Complete | Work | A fresh replica cache keeps its version | Finding: learning the page size cleared the cache's version, so a replica's first transaction after each open cached nothing. `learning_the_page_size_keeps_the_version`. |
+| Complete | Work | A missing database reads at version 0 | Finding: the store answered reads of a database nobody had written without a version, so a replica never pinned one. `a_missing_database_reads_as_empty_at_version_zero`. |
+| Complete | Test | One outcome table in the VOPR | Findings: the cross-database step skipped the idle check after its crash and left its crashes and ambiguous commits out of the totals, and three steps each encoded the allowed states. `Sim::settle` serves `crash`, `resolve` and `cross_database`. |
 | Complete | Doc | README in the style of `../s3-accelerator` and `../wirenet` | `README.md`; the quick start ran as written on 2026-10-25. |

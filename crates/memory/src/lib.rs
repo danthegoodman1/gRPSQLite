@@ -159,7 +159,12 @@ impl Store {
         let file = req.file.unwrap_or_default();
         let kind = file_kind(&file)?;
         let Some(db) = self.databases.get(&file.database) else {
-            return Ok(proto::ReadResponse::default());
+            // A database nobody has written is empty at version 0.
+            return Ok(proto::ReadResponse {
+                version: self.encode_version(0),
+                size: (kind == FileKind::Main).then_some(0),
+                ..proto::ReadResponse::default()
+            });
         };
         let version = self.read_version(db, &file, &req.version)?;
         let (data, size) = match kind {
@@ -221,7 +226,10 @@ impl Store {
         let file = req.file.unwrap_or_default();
         let kind = file_kind(&file)?;
         let Some(db) = self.databases.get(&file.database) else {
-            return Ok(proto::GetFileSizeResponse::default());
+            return Ok(proto::GetFileSizeResponse {
+                size: 0,
+                version: self.encode_version(0),
+            });
         };
         let version = self.read_version(db, &file, &req.version)?;
         let size = match kind {
@@ -812,6 +820,30 @@ mod tests {
         let err = commit(&mut store, &a.lease, 0, b"a", 10_001).unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         commit(&mut store, &b.lease, 0, b"b", 10_002).unwrap();
+    }
+
+    #[test]
+    fn a_missing_database_reads_as_empty_at_version_zero() {
+        let mut store = Store::new(Options::default());
+        let resp = store
+            .read(proto::ReadRequest {
+                file: main_ref("none", ""),
+                offset: 0,
+                length: 100,
+                version: Bytes::new(),
+                checksum: 0,
+            })
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        assert!(resp.data.is_empty());
+        assert_eq!(resp.size, Some(0));
+        assert_eq!(resp.version, Bytes::copy_from_slice(&0u64.to_be_bytes()));
+        let size = store
+            .get_file_size(proto::GetFileSizeRequest {
+                file: main_ref("none", ""),
+                version: Bytes::new(),
+            })
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(size.version, resp.version);
     }
 
     #[test]

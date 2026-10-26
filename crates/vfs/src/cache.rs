@@ -419,7 +419,10 @@ impl PageCache {
         if let Some(size) = header_page_size(data)
             && size != self.page_size
         {
-            self.clear();
+            // Pages exist only once the page size is known.
+            if self.page_size != 0 {
+                self.clear();
+            }
             self.page_size = size;
         }
     }
@@ -667,6 +670,16 @@ mod tests {
 
     fn reader_cache(store: &Shared) -> PageCache {
         PageCache::open(&settings(store), "db", true, true).unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn learning_the_page_size_keeps_the_version() {
+        let store = Shared::default();
+        let mut c = reader_cache(&store);
+        c.advance_to(Bytes::from_static(b"v1"), None);
+        c.put_read(0, 512, Bytes::from(header(1)));
+        assert_eq!(c.valid_at(), Some(&Bytes::from_static(b"v1")));
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

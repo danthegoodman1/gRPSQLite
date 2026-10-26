@@ -38,12 +38,15 @@ pub struct Core {
     config: Result<Config, String>,
     cache: Option<CacheSettings>,
     /// Open databases by path and read-only flag.
-    dbs: Mutex<BTreeMap<(String, bool), Arc<Db>>>,
-    /// Named in-memory files: rollback and super journals on servers with
-    /// atomic commits.
-    local: Mutex<BTreeMap<String, LocalFile>>,
+    dbs: Mutex<BTreeMap<DbKey, Arc<Db>>>,
+    /// A lock per database, held while it opens or closes, so those steps
+    /// run one at a time for each database without holding up the others.
+    gates: Mutex<BTreeMap<DbKey, Arc<Mutex<()>>>>,
     next_id: AtomicU64,
 }
+
+/// A database's path and read-only flag.
+type DbKey = (String, bool);
 
 /// One database open in this process.
 struct Db {
@@ -67,6 +70,10 @@ struct DbState {
     /// Read-write only: the main file's committed size.
     size: Option<u64>,
     cache: Option<PageCache>,
+    /// On servers with atomic commits: the rollback and super journals, in
+    /// memory, by name. They belong to this `Db`, so a replacement opened
+    /// after it broke never sees them.
+    journals: BTreeMap<String, LocalFile>,
     /// Every operation fails until the database reopens: the lease is gone,
     /// or a WAL write has an unknown outcome.
     broken: bool,
@@ -196,7 +203,8 @@ pub struct RemoteFile {
 
 pub struct LocalHandle {
     file: LocalFile,
-    name: Option<String>,
+    /// For a journal: its name and the database that holds it.
+    journal: Option<(String, Arc<Db>)>,
     delete_on_close: bool,
     readonly: bool,
 }
@@ -259,14 +267,40 @@ impl Core {
             config,
             cache,
             dbs: Mutex::new(BTreeMap::new()),
-            local: Mutex::new(BTreeMap::new()),
+            gates: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
         }
     }
 
-    /// Whether no database or in-memory file is open.
+    /// Whether no database is open.
     pub fn is_idle(&self) -> bool {
-        self.dbs.lock().is_empty() && self.local.lock().is_empty()
+        self.dbs.lock().is_empty()
+    }
+
+    /// Runs `f` holding the gate for one database.
+    fn gated<T>(&self, key: &DbKey, f: impl FnOnce() -> T) -> T {
+        let gate = self.gates.lock().entry(key.clone()).or_default().clone();
+        let out = {
+            let _held = gate.lock();
+            f()
+        };
+        let mut gates = self.gates.lock();
+        // Only the map and this call hold the gate, so no one waits on it.
+        if Arc::strong_count(&gate) == 2 {
+            gates.remove(key);
+        }
+        out
+    }
+
+    /// The database a journal, WAL or super journal belongs to, and the
+    /// file's kind on the server; a super journal has none.
+    fn owner(&self, path: &str) -> Option<(Arc<Db>, Option<FileKind>)> {
+        if let Some((db_path, kind)) = sidecar(path) {
+            return self.find_db(db_path).map(|db| (db, Some(kind)));
+        }
+        super_journal_db(path)
+            .and_then(|db_path| self.find_db(db_path))
+            .map(|db| (db, None))
     }
 
     fn find_db(&self, path: &str) -> Option<Arc<Db>> {
@@ -319,21 +353,20 @@ impl Core {
             (OpenKind::MainJournal | OpenKind::Wal, Some(path)) => {
                 self.open_sidecar(path, readonly, delete_on_close)
             }
-            (OpenKind::SuperJournal, Some(path)) => {
-                let atomic = super_journal_db(path)
-                    .and_then(|db| self.find_db(db))
-                    .is_some_and(|db| db.atomic);
-                if !atomic {
+            (OpenKind::SuperJournal, Some(path)) => match self.owner(path) {
+                Some((db, _)) if db.atomic => {
+                    Ok(Self::open_journal(&db, path, readonly, delete_on_close))
+                }
+                _ => {
                     log::error!(
                         "a transaction that writes several databases needs a server with atomic commits"
                     );
-                    return Err(vars::SQLITE_CANTOPEN);
+                    Err(vars::SQLITE_CANTOPEN)
                 }
-                Ok(self.open_local_named(path, readonly, delete_on_close))
-            }
+            },
             _ => Ok(Handle::Local(LocalHandle {
                 file: LocalFile::default(),
-                name: None,
+                journal: None,
                 delete_on_close: true,
                 readonly,
             })),
@@ -342,61 +375,26 @@ impl Core {
 
     fn open_main(&self, config: &Config, path: &str, readonly: bool) -> VfsResult<Handle> {
         let key = (path.to_string(), readonly);
-        let mut dbs = self.dbs.lock();
-        let db = match dbs.get(&key) {
-            Some(db) if !db.state.lock().broken => db.clone(),
-            _ => {
-                let resp = self
-                    .backend
-                    .open(proto::OpenRequest {
-                        client_token: config.client_token.clone(),
-                        database: path.to_string(),
-                        readonly,
-                    })
-                    .map_err(|s| {
-                        log::error!("opening {path}: {s}");
-                        vars::SQLITE_CANTOPEN
-                    })?;
-                if readonly && !(resp.point_in_time_reads && resp.atomic_commit) {
-                    log::error!(
-                        "opening {path} read-only needs a server with point-in-time reads and atomic commits"
-                    );
-                    let _ = self.backend.close(proto::CloseRequest {
-                        session: resp.session,
-                        lease: resp.lease,
-                        database: path.to_string(),
-                    });
-                    return Err(vars::SQLITE_CANTOPEN);
+        let db = self.gated(&key, || -> VfsResult<Arc<Db>> {
+            // A database whose lease lapsed breaks here, and the open starts
+            // a new session.
+            let open = self
+                .dbs
+                .lock()
+                .get(&key)
+                .filter(|db| self.check(db).is_ok())
+                .cloned();
+            let db = match open {
+                Some(db) => db,
+                None => {
+                    let db = self.open_session(config, path, readonly)?;
+                    self.dbs.lock().insert(key.clone(), db.clone());
+                    db
                 }
-                let cache = self
-                    .cache
-                    .as_ref()
-                    // Every commit through an atomic server updates the
-                    // header's change counter, which confirms reused pages.
-                    .and_then(|c| {
-                        PageCache::open(c, path, readonly, readonly || resp.atomic_commit)
-                    });
-                let db = Arc::new(Db {
-                    path: path.to_string(),
-                    readonly,
-                    session: resp.session,
-                    lease: resp.lease,
-                    atomic: resp.atomic_commit,
-                    changed_pages: resp.changed_pages,
-                    sector_size: match resp.sector_size {
-                        0 => 4096,
-                        s => s as i32,
-                    },
-                    state: Mutex::new(DbState {
-                        cache,
-                        ..DbState::default()
-                    }),
-                });
-                dbs.insert(key, db.clone());
-                db
-            }
-        };
-        db.state.lock().main_handles += 1;
+            };
+            db.state.lock().main_handles += 1;
+            Ok(db)
+        })?;
         Ok(Handle::Main(MainFile {
             db,
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
@@ -406,6 +404,54 @@ impl Core {
             ahead: None,
             next_read: 0,
             run: 0,
+        }))
+    }
+
+    /// Starts a session for a database this process has not opened.
+    fn open_session(&self, config: &Config, path: &str, readonly: bool) -> VfsResult<Arc<Db>> {
+        let resp = self
+            .backend
+            .open(proto::OpenRequest {
+                client_token: config.client_token.clone(),
+                database: path.to_string(),
+                readonly,
+            })
+            .map_err(|s| {
+                log::error!("opening {path}: {s}");
+                vars::SQLITE_CANTOPEN
+            })?;
+        if readonly && !(resp.point_in_time_reads && resp.atomic_commit) {
+            log::error!(
+                "opening {path} read-only needs a server with point-in-time reads and atomic commits"
+            );
+            let _ = self.backend.close(proto::CloseRequest {
+                session: resp.session,
+                lease: resp.lease,
+                database: path.to_string(),
+            });
+            return Err(vars::SQLITE_CANTOPEN);
+        }
+        let cache = self
+            .cache
+            .as_ref()
+            // Every commit through an atomic server updates the header's
+            // change counter, which confirms reused pages.
+            .and_then(|c| PageCache::open(c, path, readonly, readonly || resp.atomic_commit));
+        Ok(Arc::new(Db {
+            path: path.to_string(),
+            readonly,
+            session: resp.session,
+            lease: resp.lease,
+            atomic: resp.atomic_commit,
+            changed_pages: resp.changed_pages,
+            sector_size: match resp.sector_size {
+                0 => 4096,
+                s => s as i32,
+            },
+            state: Mutex::new(DbState {
+                cache,
+                ..DbState::default()
+            }),
         }))
     }
 
@@ -429,19 +475,20 @@ impl Core {
         }
         // The server never holds part of a transaction, so a journal never
         // needs to outlive this process.
-        Ok(self.open_local_named(path, readonly, delete_on_close))
+        Ok(Self::open_journal(&db, path, readonly, delete_on_close))
     }
 
-    fn open_local_named(&self, path: &str, readonly: bool, delete_on_close: bool) -> Handle {
-        let file = self
-            .local
+    fn open_journal(db: &Arc<Db>, path: &str, readonly: bool, delete_on_close: bool) -> Handle {
+        let file = db
+            .state
             .lock()
+            .journals
             .entry(path.to_string())
             .or_default()
             .clone();
         Handle::Local(LocalHandle {
             file,
-            name: Some(path.to_string()),
+            journal: Some((path.to_string(), db.clone())),
             delete_on_close,
             readonly,
         })
@@ -452,8 +499,8 @@ impl Core {
             Handle::Main(f) => self.close_main(f),
             Handle::Remote(_) => {}
             Handle::Local(f) => {
-                if let (true, Some(name)) = (f.delete_on_close, f.name) {
-                    self.local.lock().remove(&name);
+                if let (true, Some((name, db))) = (f.delete_on_close, f.journal) {
+                    db.state.lock().journals.remove(&name);
                 }
             }
         }
@@ -468,58 +515,53 @@ impl Core {
         if !f.txn.is_empty() {
             log::debug!("discarding uncommitted writes to {} at close", f.db.path);
         }
-        let last = {
-            let mut st = f.db.state.lock();
-            st.locks.unlock(f.id, LockLevel::Unlocked);
-            st.main_handles -= 1;
-            st.main_handles == 0
-        };
-        if !last {
-            return;
-        }
         let db = &f.db;
-        let mut dbs = self.dbs.lock();
         let key = (db.path.clone(), db.readonly);
-        if dbs.get(&key).is_some_and(|d| Arc::ptr_eq(d, db)) {
-            dbs.remove(&key);
-        }
-        if !db.readonly {
-            let journal = format!("{}-journal", db.path);
-            let super_prefix = format!("{}-mj", db.path);
-            self.local
-                .lock()
-                .retain(|name, _| *name != journal && !name.starts_with(&super_prefix));
-        }
-        {
-            let mut st = db.state.lock();
-            if let Some(cache) = st.cache.take() {
-                cache.close(st.header.as_deref());
+        // Holding the gate makes a concurrent open of this database wait
+        // until the lease is released.
+        self.gated(&key, || {
+            {
+                let mut st = db.state.lock();
+                st.locks.unlock(f.id, LockLevel::Unlocked);
+                st.main_handles -= 1;
+                if st.main_handles > 0 {
+                    return;
+                }
+                if let Some(cache) = st.cache.take() {
+                    cache.close(st.header.as_deref());
+                }
+                st.journals.clear();
             }
-        }
-        // Holding `dbs` makes a concurrent open of this database wait until
-        // the lease is released.
-        if let Err(s) = self.backend.close(proto::CloseRequest {
-            session: db.session.clone(),
-            lease: db.lease.clone(),
-            database: db.path.clone(),
-        }) {
-            log::warn!("closing {}: {s}", db.path);
-        }
+            {
+                let mut dbs = self.dbs.lock();
+                if dbs.get(&key).is_some_and(|d| Arc::ptr_eq(d, db)) {
+                    dbs.remove(&key);
+                }
+            }
+            if let Err(s) = self.backend.close(proto::CloseRequest {
+                session: db.session.clone(),
+                lease: db.lease.clone(),
+                database: db.path.clone(),
+            }) {
+                log::warn!("closing {}: {s}", db.path);
+            }
+        });
     }
 
     pub fn access(&self, path: &str, _flags: AccessFlags) -> VfsResult<bool> {
-        if let Some(f) = self.local.lock().get(path) {
-            return Ok(!f.0.lock().is_empty());
-        }
-        let Some((db_path, kind)) = sidecar(path) else {
-            return Ok(false);
-        };
-        let Some(db) = self.find_db(db_path) else {
+        let Some((db, kind)) = self.owner(path) else {
             return Ok(false);
         };
         if db.atomic {
-            return Ok(false);
+            let st = db.state.lock();
+            return Ok(st
+                .journals
+                .get(path)
+                .is_some_and(|f| !f.0.lock().is_empty()));
         }
+        let Some(kind) = kind else {
+            return Ok(false);
+        };
         self.check(&db)?;
         // Like the unix VFS, an empty file does not exist.
         let resp = self
@@ -534,18 +576,16 @@ impl Core {
 
     pub fn delete(&self, path: &str) -> VfsResult<()> {
         log::debug!("delete {path}");
-        if self.local.lock().remove(path).is_some() {
-            return Ok(());
-        }
-        let Some((db_path, kind)) = sidecar(path) else {
-            return Ok(());
-        };
-        let Some(db) = self.find_db(db_path) else {
+        let Some((db, kind)) = self.owner(path) else {
             return Ok(());
         };
         if db.atomic {
+            db.state.lock().journals.remove(path);
             return Ok(());
         }
+        let Some(kind) = kind else {
+            return Ok(());
+        };
         self.check(&db)?;
         self.backend
             .delete(proto::DeleteRequest {
@@ -1012,9 +1052,12 @@ impl Core {
         Ok(())
     }
 
+    /// SQLite asks before treating a journal as hot. A replica answers yes:
+    /// its server holds only committed states, so any journal it sees is a
+    /// writer's in this process, live and none of its business.
     pub fn check_reserved_lock(&self, handle: &mut Handle) -> VfsResult<bool> {
         Ok(match handle {
-            Handle::Main(f) => f.db.state.lock().locks.reserved(),
+            Handle::Main(f) => f.db.readonly || f.db.state.lock().locks.reserved(),
             _ => false,
         })
     }
@@ -1101,6 +1144,11 @@ pub struct GrpsqliteVfs(pub Arc<Core>);
 
 impl sqlite_plugin::vfs::Vfs for GrpsqliteVfs {
     type Handle = Handle;
+
+    // WAL works only in exclusive locking mode, where SQLite keeps the WAL
+    // index in heap memory. Without shared memory, SQLite refuses WAL in
+    // normal locking mode instead of failing every later read.
+    const SHARED_MEMORY: bool = false;
 
     fn open(&self, path: Option<&str>, opts: OpenOpts) -> VfsResult<Handle> {
         self.0.open(path, opts)

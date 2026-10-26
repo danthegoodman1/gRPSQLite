@@ -140,7 +140,7 @@ The lease holder keeps the database header and file size in memory and updates t
 
 A read-write open acquires the database's lease, and a background task heartbeats it. The server checks the lease inside the same transaction that applies a commit. When a heartbeat fails, or none succeeds within the lease's TTL, the VFS fails every operation on the database with `SQLITE_IOERR` and drops its caches until the application reopens it. A reopen acquires the lease again.
 
-Several connections to one database in a process share the lease, and an in-process lock table enforces SQLite's lock levels among them.
+Several connections to one database in a process share the lease, and an in-process lock table enforces SQLite's lock levels among them. Rollback journals belong to the session that wrote them, so a connection opened after a lease loss never plays back the broken session's journal over another writer's commits.
 
 ### Replicas
 
@@ -165,6 +165,8 @@ Without `atomic_commit`, SQLite's own crash recovery protects transactions. The 
 PRAGMA locking_mode=exclusive;
 PRAGMA journal_mode=wal;
 ```
+
+The VFS has no shared memory, so in normal locking mode SQLite keeps the database out of WAL, and a connection that opens a WAL database without exclusive locking fails with `SQLITE_CANTOPEN`.
 
 SQLite treats a failed WAL write as one that never happened, yet the frames may have reached the server and completed a commit. After a failed WAL write, the VFS fails every operation until the database reopens, and the reopen rebuilds SQLite's WAL index from the server.
 

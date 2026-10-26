@@ -347,3 +347,94 @@ fn wal_write_with_a_lost_response_breaks_the_writer() {
     );
     assert_eq!(integrity(&conn), "ok");
 }
+
+/// Without shared memory, SQLite keeps a normal-locking connection out of
+/// WAL instead of switching and then failing every read.
+#[test]
+fn wal_needs_exclusive_locking() {
+    let (_backend, client) = setup(non_atomic());
+    let conn = client.open("wal-normal.db").unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=wal", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    drop(conn);
+
+    let conn = client.open("wal-normal.db").unwrap();
+    conn.execute_batch("PRAGMA locking_mode=exclusive").unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=wal", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    conn.execute_batch("INSERT INTO t VALUES (2)").unwrap();
+    drop(conn);
+
+    let conn = client.open("wal-normal.db").unwrap();
+    let err = conn
+        .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+        .unwrap_err();
+    assert_eq!(sqlite_code(&err), Some(ErrorCode::CannotOpen));
+    drop(conn);
+    let conn = client.open("wal-normal.db").unwrap();
+    conn.execute_batch("PRAGMA locking_mode=exclusive").unwrap();
+    assert_eq!(count(&conn, "SELECT count(*) FROM t"), 2);
+}
+
+/// A replica in the same process as a writer mid-transaction must not take
+/// the writer's in-memory journal for a hot one.
+#[test]
+fn a_replica_ignores_a_live_writer_journal_in_its_process() {
+    let (_backend, client) = setup(atomic());
+    let writer = client.open("live.db").unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=delete; CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    writer
+        .execute_batch("BEGIN; INSERT INTO t VALUES (2);")
+        .unwrap();
+    let replica = client.open_readonly("live.db").unwrap();
+    assert_eq!(count(&replica, "SELECT count(*) FROM t"), 1);
+    writer.execute_batch("COMMIT").unwrap();
+    assert_eq!(count(&replica, "SELECT count(*) FROM t"), 2);
+}
+
+/// A connection that lost its lease mid-transaction leaves an in-memory
+/// journal behind. After another process takes over and commits, a new
+/// connection in the first process must read the server's state, not play
+/// back that stale journal over it.
+#[test]
+fn a_reopened_database_ignores_the_broken_connection_journal() {
+    let (backend, client) = setup(atomic());
+    let old = client.open("stale.db").unwrap();
+    old.execute_batch(
+        "PRAGMA journal_mode=delete; PRAGMA cache_size=10;
+         CREATE TABLE t(a INTEGER PRIMARY KEY, b);
+         WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM s WHERE x < 500)
+         INSERT INTO t SELECT x, 'old' FROM s;",
+    )
+    .unwrap();
+    old.execute_batch("BEGIN; UPDATE t SET b = 'mine';")
+        .unwrap();
+    backend.stall_heartbeats("stale.db");
+    backend.advance(backend.lease_ttl() + 1);
+
+    let other = Client::new(backend.clone(), None);
+    let conn = other.open("stale.db").unwrap();
+    conn.execute_batch("UPDATE t SET b = 'theirs'").unwrap();
+    drop(conn);
+    drop(other);
+
+    let new = client.open("stale.db").unwrap();
+    new.execute_batch("PRAGMA journal_mode=delete").unwrap();
+    assert_eq!(
+        count(&new, "SELECT count(*) FROM t WHERE b = 'theirs'"),
+        500
+    );
+    new.execute_batch("UPDATE t SET b = 'next' WHERE a <= 10")
+        .unwrap();
+    drop(old);
+    assert_eq!(count(&new, "SELECT count(*) FROM t WHERE b = 'next'"), 10);
+    assert_eq!(integrity(&new), "ok");
+}

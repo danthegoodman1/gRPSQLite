@@ -36,8 +36,8 @@ MUTANTS = [
         "journal-exists-locally-only",
         "G1: a crash on a server without atomic commits rolls back from the journal",
         VFS,
-        "        if db.atomic {\n            return Ok(false);\n        }\n        self.check(&db)?;\n        // Like the unix VFS",
-        "        if true {\n            return Ok(false);\n        }\n        self.check(&db)?;\n        // Like the unix VFS",
+        "        self.check(&db)?;\n        // Like the unix VFS",
+        "        return Ok(false);\n        // Like the unix VFS",
     ),
     (
         "stale-state-after-commit",

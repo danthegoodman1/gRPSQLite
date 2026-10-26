@@ -50,6 +50,9 @@ pub struct SimConfig {
     pub max_value: usize,
     pub steps: u64,
     pub retained_versions: u64,
+    /// Ask for exclusive locking on a server with atomic commits, which the
+    /// VFS must refuse.
+    pub try_exclusive: bool,
 }
 
 impl SimConfig {
@@ -92,7 +95,7 @@ impl SimConfig {
             cache_size: *rng.pick(&[10, 10, 50, 500]),
             journal_mode,
             exclusive,
-            synchronous: *rng.pick(&["OFF", "NORMAL", "FULL"]),
+            synchronous: rng.pick(&["OFF", "NORMAL", "FULL"]),
             cache,
             faults,
             crashes: rng.percent(50),
@@ -101,6 +104,7 @@ impl SimConfig {
             max_value: *rng.pick(&[16, 200, 2000, 20_000]),
             steps: rng.range(40..=200),
             retained_versions: *rng.pick(&[3, 50, 10_000]),
+            try_exclusive: atomic && Prng::stream(seed, "config-exclusive").percent(20),
         }
     }
 }
@@ -231,6 +235,9 @@ struct Sim {
     seed: u64,
     cfg: SimConfig,
     rng: Prng,
+    /// Decides actions added after the original workload, so adding them
+    /// leaves the original draws unchanged.
+    extra: Prng,
     backend: Arc<SimBackend>,
     cache: Option<CacheSettings>,
     writer: Client,
@@ -271,6 +278,7 @@ pub fn run_with(seed: u64, cfg: SimConfig, verbose: bool) -> Result<Report, Stri
     let mut sim = Sim {
         seed,
         rng: Prng::stream(seed, "workload"),
+        extra: Prng::stream(seed, "workload-extra"),
         cfg,
         backend,
         cache,
@@ -317,6 +325,9 @@ impl Sim {
             self.report.steps += 1;
             let dt = self.rng.range(0..=1500);
             self.backend.advance(dt);
+            if self.cfg.point_in_time && self.extra.percent(5) {
+                self.long_reader()?;
+            }
             let roll = self.rng.below(100);
             match roll {
                 0..=49 => self.transaction(false)?,
@@ -386,6 +397,8 @@ impl Sim {
         c.busy_timeout(std::time::Duration::ZERO)?;
         if self.cfg.exclusive {
             c.execute_batch("PRAGMA locking_mode=exclusive")?;
+        } else if self.cfg.try_exclusive {
+            let _ = c.execute_batch("PRAGMA locking_mode=exclusive");
         }
         c.execute_batch(&format!(
             "PRAGMA page_size={}; PRAGMA cache_size={}; PRAGMA synchronous={};",
@@ -620,29 +633,70 @@ impl Sim {
         Ok(())
     }
 
-    fn check_reader(&mut self) -> Result<(), String> {
+    /// The replica's connection, opened on first use.
+    fn reader_conn(&mut self) -> Option<&Connection> {
         if self.reader.is_none() {
             let client = Client::new(self.backend.clone(), self.cache.clone());
             self.reader = Some((client, None));
         }
-        let Some((client, conn)) = &mut self.reader else {
+        let (client, conn) = self.reader.as_mut()?;
+        if conn.is_none() {
+            let c = client.open_readonly(DB).ok()?;
+            let _ = c.execute_batch(&format!("PRAGMA cache_size={}", self.cfg.cache_size));
+            *conn = Some(c);
+        }
+        conn.as_ref()
+    }
+
+    /// Holds a read-only transaction open while the writer commits: every
+    /// read in it must see the version its first read saw.
+    fn long_reader(&mut self) -> Result<(), String> {
+        let Some(c) = self.reader_conn() else {
             return Ok(());
         };
-        if conn.is_none() {
-            match client.open_readonly(DB) {
-                Ok(c) => {
-                    let _ = c.execute_batch(&format!("PRAGMA cache_size={}", self.cfg.cache_size));
-                    *conn = Some(c);
+        if c.execute_batch("BEGIN").is_err() {
+            return Ok(());
+        }
+        let first = digest_db(c);
+        let Some((_, conn)) = &mut self.reader else {
+            return Ok(());
+        };
+        let conn = conn.take();
+        let mut result = Ok(());
+        if let (Ok(d), Some(c)) = (&first, &conn) {
+            self.note("long-reader", *d);
+            if !self.history.contains(d) {
+                result = Err(self.fail("a read-only transaction saw a state that was never committed"));
+            } else {
+                for _ in 0..self.extra.range(1..=3) {
+                    self.transaction(false)?;
                 }
-                Err(_) => return Ok(()),
+                if let Ok(again) = digest_db(c) {
+                    self.report.reader_checks += 1;
+                    if again != *d {
+                        result = Err(self.fail("a read-only transaction's view changed while it ran"));
+                    }
+                }
             }
         }
-        let Some(c) = conn.as_ref() else {
+        if let Some(c) = &conn {
+            let _ = c.execute_batch("ROLLBACK");
+        }
+        if let Some((_, slot)) = &mut self.reader {
+            *slot = conn;
+        }
+        result
+    }
+
+    fn check_reader(&mut self) -> Result<(), String> {
+        let Some(c) = self.reader_conn() else {
             return Ok(());
         };
         let result = digest_db(c);
         if self.rng.percent(20) {
-            *conn = None;
+            if let Some((_, conn)) = &mut self.reader {
+                *conn = None;
+            }
         }
         if let Ok(d) = result {
             self.report.reader_checks += 1;

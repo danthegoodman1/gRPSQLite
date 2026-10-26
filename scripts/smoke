@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Runs examples/*.sql through target/sqlite/sqlite3-grpsqlite against the
+# memory server. Build first with scripts/build-sqlite.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+shell="$root/target/sqlite/sqlite3-grpsqlite"
+server="$root/target/release/memory-server"
+cargo build --release -p grpsqlite-memory
+port=50171
+pid=
+
+stop() {
+  if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
+  pid=
+}
+trap stop EXIT
+
+run() {
+  local args=$1
+  shift
+  "$server" --addr "127.0.0.1:$port" $args > /dev/null 2>&1 < /dev/null &
+  pid=$!
+  for _ in $(seq 50); do (echo > "/dev/tcp/127.0.0.1/$port") 2>/dev/null && break; sleep 0.1; done
+  for sql in "$@"; do
+    echo "== $sql ($args)"
+    GRPSQLITE_URL="http://127.0.0.1:$port" "$shell" < "$root/examples/$sql"
+  done
+  stop
+  port=$((port + 1))
+}
+
+run "" atomic.sql replica.sql
+run "--no-atomic --no-pit" non_atomic.sql

@@ -1,272 +1,208 @@
 # gRPSQLite <!-- omit in toc -->
 
-**A SQLite VFS for remote databases via gRPC, turn any datastore into a SQLite backend!**
+**A SQLite VFS that stores databases on a gRPC server: turn any datastore into a SQLite backend.**
 
-gRPSQLite lets you build **multitenant, distributed SQLite databases** backed by any storage system you want. Give every user, human or AI, their own SQLite database.
+gRPSQLite lets you build multitenant, distributed SQLite databases on whatever storage you run. Give every user, human or AI, their own SQLite database.
 
-- **Real SQLite**: Works with existing SQLite tools, extensions, and applications
-- **Any storage**: File systems, cloud storage, databases, version control - store SQLite pages anywhere
-- **Instantly available**: Mount TB-scale SQLite databases in milliseconds
-- **Atomic transactions**: Dramatically faster commits via batch writes
-- **Read replicas**: Unlimited read-only instances (if your backend supports point-in-time reads)
-- **Any language**: Implement your storage backend as a simple gRPC server
-
-## Quick Start
-
-```bash
-# Terminal 1: Build and run container
-zsh static_dev.sh && docker run -it --rm --name grpsqlite sqlite-grpsqlite-static /bin/bash
-
-# Terminal 2: Start the memory server
-docker exec -it grpsqlite cargo run --example memory_server
-
-# Terminal 3: Use SQLite normally
-docker exec -it grpsqlite sqlite3_with_grpsqlite
-```
-
-In the SQLite terminal, run these commands to see it working:
-```sql
-.open main.db
-CREATE TABLE users(id, name);
-INSERT INTO users VALUES(1, 'Alice'), (2, 'Bob');
-SELECT * FROM users;
--- You'll see: 1|Alice and 2|Bob
-
--- Exit SQLite (Ctrl+C), then reconnect:
--- docker exec -it grpsqlite sqlite3_with_grpsqlite
-
-.open main.db
-SELECT * FROM users;
--- Data is still there! No local files - it's stored in the server!
-```
-
-## How It Works
-
-```
-┌─────────────┐                  ┌─────────────────┐                    ┌──────────────┐
-│   SQLite    │ ───────────────► │  gRPSQLite VFS  │ ─────────────────► │   Backend    │
-│     VFS     │    gRPC calls    │      Server     │    Your backend    │ (S3, FDB,    │
-│             │ ◄─────────────── │                 │ ◄───────────────── │  Postgres,   │
-└─────────────┘                  └─────────────────┘                    │  etc.)       │
-                                                                        └──────────────┘
-```
-
-gRPSQLite provides a **SQLite VFS (Virtual File System)** that converts SQLite's file operations into gRPC calls. You implement a simple gRPC server that handles the operations against your backend.
+- **Real SQLite**: works with existing SQLite tools, extensions and applications, loaded at runtime or linked in.
+- **Any storage**: implement a small gRPC service over a database, an object store or a version-control system.
+- **Atomic commits**: each SQLite transaction reaches the server as one `Commit`, however large.
+- **Read replicas**: any number of read-only clients, each reading one committed version, when the server supports point-in-time reads.
+- **Any language**: the server is a plain gRPC service ([`proto/grpsqlite.proto`](proto/grpsqlite.proto)).
 
 > [!WARNING]
-> This is very early stage software.
->
-> Only primitive testing is done, and should not be used for production workloads.
->
-> Documentation and examples are not comprehensive either.
+> This is early software. The guarantees below are checked by a deterministic simulator, but gRPSQLite has not run in production.
 
 ## Table of Contents <!-- omit in toc -->
 
-- [Quick Start](#quick-start)
-- [How It Works](#how-it-works)
-- [Example Use Cases](#example-use-cases)
-- [Server Examples](#server-examples)
-  - [Example: In-memory server with read-replica support](#example-in-memory-server-with-read-replica-support)
-- [SQLite VFS: Dynamic vs Static](#sqlite-vfs-dynamic-vs-static)
-  - [Dynamic Loading](#dynamic-loading)
-  - [Statically compiling](#statically-compiling)
-- [Advanced Features](#advanced-features)
-  - [Atomic batch commits](#atomic-batch-commits)
-  - [Read-only Replicas](#read-only-replicas)
-  - [Local Page Caching](#local-page-caching)
-- [Tips for Writing a gRPC server](#tips-for-writing-a-grpc-server)
-  - [Handling page sizes and row keys](#handling-page-sizes-and-row-keys)
-  - [Reads for missing data](#reads-for-missing-data)
-  - [Leases](#leases)
-- [Performance](#performance)
+- [Quick start](#quick-start)
+- [Guarantees](#guarantees)
+- [How it works](#how-it-works)
+- [Choosing server capabilities](#choosing-server-capabilities)
+  - [Atomic commits](#atomic-commits)
+  - [Read-only replicas](#read-only-replicas)
+  - [Servers without atomic commits](#servers-without-atomic-commits)
+- [Using the VFS](#using-the-vfs)
+  - [Linked into SQLite](#linked-into-sqlite)
+  - [Loaded at runtime](#loaded-at-runtime)
+  - [From Rust](#from-rust)
+  - [Configuration](#configuration)
+- [Local page cache](#local-page-cache)
+- [Writing a server](#writing-a-server)
+- [Testing](#testing)
 - [Contributing](#contributing)
 
-## Example Use Cases
+## Quick start
 
-- **Multi-tenant SaaS**: Each customer, or user, gets their own SQLite database. Works great for serverless functions.
-- **AI/Agent workflows**: Give each AI agent its own persistent database per-chat that users can roll back
-- **Immutable Database**: Store your database in an immutable store with full history, branching, and collaboration
-- **Read fanout**: Low-write, high read rate scenarios can be easily horizontally scaled
+On Linux with a Rust toolchain and a C compiler:
 
-## Server Examples
+```bash
+# Terminal 1: the in-memory reference server
+cargo run --release -p grpsqlite-memory
 
-The fastest way to understand gRPSQLite is to try the examples. See the [`examples/`](examples/) directory for complete server implementations in Rust:
-
-- [Memory server (atomic batched writes)](examples/memory_server.rs) _- Start here!_
-- [Memory server (non-batched writes)](examples/memory_server_no_atomic.rs)
-- [Memory server (atomic + timestamped writes to support read replicas)](examples/versioned_memory_server.rs)
-
-It's easy to implement in [any language that gRPC supports](https://grpc.io/docs/languages/).
-
-### Example: In-memory server with read-replica support
-
-See [`examples/versioned_memory_server_test.sql`](examples/versioned_memory_server_test.sql) and the server [`examples/versioned_memory_server.rs`](examples/versioned_memory_server.rs)
-
-Modify the quickstart second terminal command to:
-
-```
-docker exec -it grpsqlite cargo run --example versioned_memory_server
+# Terminal 2: build a SQLite 3.54.1 shell with gRPSQLite as its default VFS
+scripts/build-sqlite
+target/sqlite/sqlite3-grpsqlite
 ```
 
-As well as running 2 SQLite clients as indicated in the above linked `.sql` file (one RW, one RO).
+In the shell:
 
-## SQLite VFS: Dynamic vs Static
-
-There are 2 ways of using the SQLite VFS:
-
-1. Dynamically load the VFS
-2. Statically compile the VFS into a SQLite binary
-
-Statically compiling in is the smoothest experience, as it becomes the default VFS when you open a database file without having to `.load` anything or use a custom setup package.
-
-### Dynamic Loading
-
-```
-cargo build --release -p sqlite_vfs --features dynamic
+```sql
+.open main.db
+CREATE TABLE users(id, name);
+INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+SELECT * FROM users;
 ```
 
-This will produce a `target/release/libsqlite_vfs.so` that you can use in SQLite:
+Quit and reopen `main.db`: the rows are still there, on the server. `examples/` holds longer scripts; `scripts/smoke` runs them all.
+
+## Guarantees
+
+- **Atomic commits.** A transaction reaches the server whole or not at all. A client crash or failure at any point leaves the server at the last committed state. Atomicity is per database; an `ATTACH` transaction commits each database separately.
+- **Durable commits.** `COMMIT` returns success only after the server acknowledges every page of the transaction. A failed `COMMIT` has an unknown outcome; the next transaction reads whichever state the server holds.
+- **Single writer.** At most one client holds a database's write lease. The server rejects writes without the current lease. A client that loses its lease stops writing and stops trusting its caches.
+- **Consistent replicas.** On a server with point-in-time reads, every read-only transaction reads exactly one committed version.
+- **Real SQLite.** Stock SQLite works, loaded at runtime or linked in, with page sizes 512–65536, rollback-journal modes, `ATTACH`, and several databases and connections per process.
+- **Invisible caches.** Local caching changes latency, never results.
+
+## How it works
 
 ```
-.load path/to/libsqlite_vfs.so
+┌──────────────────┐   gRPC    ┌──────────────────┐            ┌─────────────┐
+│ SQLite           │ ────────► │ your server      │ ─────────► │ FoundationDB│
+│ + gRPSQLite VFS  │ ◄──────── │ (any language)   │ ◄───────── │ Postgres, S3│
+└──────────────────┘           └──────────────────┘            └─────────────┘
 ```
 
-This also sets it as the default VFS.
+SQLite reads and writes its files through a VFS. The gRPSQLite VFS turns those calls into protocol requests:
 
-### Statically compiling
+- **Open** starts a session per database. A read-write open acquires the database's lease, which the VFS heartbeats in the background.
+- **Read** and **GetFileSize** fetch bytes. The lease holder always reads the latest version; a replica pins the version its first read returned until its read transaction ends.
+- **Commit** carries every page a transaction wrote. The VFS buffers writes in memory until SQLite syncs the database at commit, so cache spills and SQLite's own retries never reach the server half-done.
+- **Write**, **Truncate** and **Delete** serve servers without atomic commits, where SQLite's rollback journal or WAL lives on the server.
 
-The process:
-1. Building a static lib
-2. Use a little C stub for initializing the VFS on start (sets the default VFS)
-3. Compile SQLite with the C stub and static library
+Temporary files, statement journals and, on servers with atomic commits, rollback journals stay in client memory. Only the files that must survive a crash travel to the server.
 
-See the [`static_dev.Dockerfile`](static_dev.Dockerfile) example which does all of these steps (you'll probably want to build with `--release` though).
+## Choosing server capabilities
 
-## Advanced Features
+A server declares what it supports in its `Open` response.
 
-The provided VFS converts SQLite VFS calls to gRPC calls so that you can effectively implement a SQLite VFS via gRPC.
+### Atomic commits
 
-It manages a lot of other features for you like atomic batch commits, stable read timestamp tracking, and more.
+Set `atomic_commit` if your store can apply many writes in one transaction (FoundationDB, Postgres, DynamoDB, most databases). This is the recommended mode:
 
-Your gRPC server can then enable the various features based on the backing datastore you use (see `GetCapabilities` RPC).
+- every transaction is one round trip at commit;
+- the server stores only the main database file;
+- any rollback-journal mode works (`memory`, `delete`, `truncate`, `persist`); the journal stays in client memory, so `memory` is the cheapest.
 
-For example, if you use a database like FoundationDB that supports both atomic transactions, as well as point-in-time reads, you get the benefits of wildly more efficient SQLite atomic commits (writes the whole transaction at once, rather than writing uncommitted rows to a journal), and support for read-only SQLite instances.
+Two settings are refused with servers that have atomic commits:
 
-This supports a single read-write instance per database, and if your backing store supports it, unlimited read-only replicas.
+- `PRAGMA journal_mode=wal`: WAL needs a server without atomic commits.
+- `PRAGMA locking_mode=exclusive`: in exclusive mode SQLite stops updating the header's change counter after the first commit, and replicas rely on that counter to notice commits. The lease already makes the client the only writer, so exclusive mode gains nothing.
 
-### Atomic batch commits
+### Read-only replicas
 
-If your server implementation supports atomic batch commits (basically any DB that can do a transaction), this results in _wildly_ faster SQLite transactions.
+Set `point_in_time_reads` (with `atomic_commit`) if your store can read as of a version: FoundationDB, CockroachDB (`AS OF SYSTEM TIME`), RocksDB with user-defined timestamps, BadgerDB, or an object store behind a versioned index. Each response carries an opaque `version`; the replica sends it back to read the same version for the rest of its read transaction.
 
-By default, SQLite (in wal/wal2 mode) will write uncommitted rows to the WAL file, and rely on a commit frame to determine whether the transaction actually committed.
+Open a database read-only to get a replica:
 
-When the server supports atomic batch commits, the SQLite VFS will instead memory-buffer writes, and on commit send a single batched write to the server (`AtomicWriteBatch`). As you can guess, this is _a lot faster_.
-
-If your server supports this, clients should always use `PRAGMA journal_mode=memory` (which should be the default). If it doesn't, then clients should set `PRAGMA locking_mode=exclusive` and `PRAGMA journal_mode=wal` (or `wal2`).
-
-Why `journal_mode=memory` is ideal:
-
-1. We don't need a WAL anymore, so reads only have to hit the main database "file"
-2. Because there are no WAL writes, there is no WAL checkpointing, meaning we never have to double-write committed transactions
-3. Your gRPC server implementation can expect only a single database file, and reject bad clients using the wrong journal mode (if the file doesn't match the file that created the lease)
-
-### Read-only Replicas
-
-If your database supports point-in-time reads (letting you control the precise point in time of the transaction), then you can support read-only SQLite replicas. Without stable timestamps for reads, a read replica might see an inconsistent database state that will cause SQLite to think the database has been corrupted.
-
-The way this works is when you first submit a read for a transaction, the response will return a stable timestamp that the SQLite VFS will remember for the duration of the transaction (until atomic rollback or xUnlock is called). Subsequent reads from the same transaction will provide this timestamp to the gRPC server, which you must use to ensure that the transaction sees a stable timestamp of the database.
-
-**To start a read-only replica instance, simply open the DB in read-only mode.** The VFS will verify with the capabilities of the gRPC server implementation that it can support read-only replicas (if not, it will error on open with `SQLITE_CANTOPEN`), and will not attempt to acquire a lease on open.
-
-**Some databases that CAN support read-only replicas:**
-
-- FoundationDB
-- CockroachDB (via `AS OF SYSTEM TIME`)
-- RocksDB (with [User-defined Timestamps](https://github.com/facebook/rocksdb/wiki/User-defined-Timestamp))
-- [BadgerDB](https://github.com/hypermodeinc/badger)
-- S3 with a WAL layer [^1]
-- [Git repos...](https://github.com/danthegoodman1/gRPSQLite/issues/8)
-
-[^1]: S3 requires a WAL indirection on top since it doesn't support reading previous object versions. You can use conditional writes as a "weak" leasing layer (doesn't transactionally guarantee when writing pages), and write to a WAL that points page references to S3 files. Then, at query time, you read the WAL to find the real page file. This is how a previous project of mine [icedb](https://github.com/danthegoodman1/icedb) worked! However you'll still need compaction. You could also use [slatedb](https://slatedb.io/) but the performance will likely be lower than a custom WAL layer.
-
-**Some databases that CANNOT support read-only replicas (at least independently):**
-
-- Postgres
-- MySQL
-- Redis
-- S3 as "file per page"
-- Most filesystems
-- SQLite
-
-For filesystems like S3, you could use a dedicated metadata DB for managing pages, effectively separating data and metadata. Separating metadata and page can be great for larger page sizes.
-
-You can see an example using the SQL [`examples/versioned_memory_server_test.sql`](examples/versioned_memory_server_test.sql) and the server [`examples/versioned_memory_server.rs`](examples/versioned_memory_server.rs) of a RW instance making updates, and a non-blocking RO reading the data. This example uses an copy-on-write `Vec<u8>`, with versions timestamped every write.
-
-### Local Page Caching
-
-See configuration in [`env_config.rs`](./sqlite_vfs/src/env_config.rs).
-
-You can enable local page caching, enabling reads for pages that haven't changed since the last time the VFS saw to be faster.
-
-How it works:
-1. When the VFS writes, it includes the checksum of the data, which you should store
-2. When the VFS reads, it includes the checksum that it has locally
-3. If the checksum matches what you have at the server you can respond with a blank data array, which tells the VFS to read the local copy
-4. The VFS will read the page into memory, verify the checksum, and return it to SQLite
-
-Depending on how you store data, this can dramatically speed up reads.
-
-_Because the first page of the DB is accessed so aggressively, it's always cached in memory on the RW instance._
-
-The cache currently uses a file per page. While this is less than ideal performance wise, it makes LRU-style caching simpler. The first page is always skipped, as it's always held in memory.
-
-You may also configure "blind local reads", which will forces reads to run fully locally if the data is cached. This choose performance at the expense of not guaranteeing a held lease, and possibly reading stale data.
-
-## Tips for Writing a gRPC server
-
-An over-simplification: You are effectively writing a remote block device.
-
-### Handling page sizes and row keys
-
-Because SQLite uses stable page sizes (and predictable database/wal headers), you can key by the (integer division) `offset / page_size` (`page_size` sometimes called `sector_size` internally to SQLite) interval. SQLite should always
-perform writes on the `page_size` interval already, but it's a good idea to verify on write to prevent malicious clients from corrupting the DB.
-
-This VFS has `SQLITE_IOCAP_SUBPAGE_READ` disabled, which would otherwise allow reads to occur at non-offset intervals.
-However, it will still often read at special offsets and lengths for the database header. The following is an example of what operations are called on the main db file when it is first opened:
-
-```
-read            file=main.db offset=0 length=100
-get_file_size   file=main.db
-read            file=main.db offset=0 length=4096
-read            file=main.db offset=24 length=16
-get_file_size   file=main.db
+```sql
+.open --readonly main.db
 ```
 
-It does reads both at sub-page lengths, as well as non-page_size offsets.
+Stores that cannot read a past version (Postgres, MySQL, Redis, plain filesystems) cannot serve replicas on their own.
 
-The simplest way to handle this is when ever you get an offset for a read, use the key (integer division) `(offset / page_size) * page_size`. You should still return the data at the expected offset and length to the gRPC call (e.g. convert `offset=24 length=16` to `key=0` and return the `[24:24+16]` bytes)
+### Servers without atomic commits
 
-### Reads for missing data
+Without `atomic_commit`, SQLite's own crash recovery protects transactions: the rollback journal or WAL lives on the server, and after a crash the next writer replays the journal. Use `journal_mode=delete`, `truncate` or `persist`, or WAL with exclusive locking, set before the first read:
 
-You need to return the requested length data, if it doesn't exist, return zeros. See examples.
+```sql
+PRAGMA locking_mode=exclusive;
+PRAGMA journal_mode=wal;
+```
 
-### Leases
+Each `Write` must apply atomically. A transaction that writes several attached databases needs a server with atomic commits.
 
-When ever a write occurrs, you MUST transactionally verify that the lease is still valid before submitting the write.
+## Using the VFS
 
-If you do not support atomic writes (e.g. backed by S3), then you will have to do either some sort of 2PC, or track metadata (pages) within an external transactional database (e.g. Postgres).
+The VFS is the `grpsqlite` crate (`crates/vfs`).
 
+### Linked into SQLite
 
-## Performance
+```bash
+cargo build --release -p grpsqlite --features static
+```
 
-While the network adds some overhead, gRPSQLite makes up expected dramatic performance differences through atomic batch commits and read replicas.
+builds `target/release/libgrpsqlite.a`. Compile SQLite with `-DSQLITE_EXTRA_INIT=grpsqlite_extra_init` and link the library; SQLite then registers gRPSQLite as its default VFS during `sqlite3_initialize`. [`scripts/build-sqlite`](scripts/build-sqlite) does this for the SQLite shell.
 
-Atomic batch commits mean that you only send a single write operation to the gRPC server, which is likely using a backing DB that does all transaction writes at once (FDB, DynamoDB).
+### Loaded at runtime
 
-Additionally, if using a DB that supports read replicas, you can scale reads out for additional machines aggressively, especially when combined with tiered caches.
+```bash
+cargo build --release -p grpsqlite --features dynamic
+```
+
+builds `target/release/libgrpsqlite.so`, which any SQLite can load:
+
+```sql
+.load target/release/libgrpsqlite
+```
+
+Loading registers gRPSQLite as the default VFS.
+
+### From Rust
+
+With the `static` feature, `grpsqlite::register_static` registers a `Core` under any name, next to SQLite's own VFSes. `Core` takes any `Backend`; `GrpcBackend` is the gRPC client. `crates/sim/src/harness.rs` shows the pattern with rusqlite.
+
+### Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `GRPSQLITE_URL` | `http://localhost:50051` | The server. |
+| `GRPSQLITE_CLIENT_TOKEN` | empty | Sent with every `Open`. |
+| `GRPSQLITE_CONNECT_TIMEOUT_MS` | `10000` | Connection timeout. |
+| `GRPSQLITE_RPC_TIMEOUT_MS` | `30000` | Deadline for each request. |
+| `GRPSQLITE_KEEPALIVE_INTERVAL_MS` | `10000` | HTTP/2 keepalive interval. |
+| `GRPSQLITE_KEEPALIVE_TIMEOUT_MS` | `20000` | HTTP/2 keepalive timeout. |
+| `GRPSQLITE_CACHE_DIR` | unset | Local page cache directory; set with `GRPSQLITE_CACHE_MAX_BYTES`. |
+| `GRPSQLITE_CACHE_MAX_BYTES` | unset | Most bytes each open database may cache. |
+| `GRPSQLITE_LOG` | `warn` | `off`, `error`, `warn`, `info`, `debug` or `trace`, sent to `sqlite3_log`. |
+
+An invalid setting makes every open fail with `SQLITE_CANTOPEN` and logs the reason; the host process keeps running.
+
+## Local page cache
+
+Set `GRPSQLITE_CACHE_DIR` and `GRPSQLITE_CACHE_MAX_BYTES` to cache pages on local disk, one file per page, evicting the least recently used.
+
+- **Writer:** while it holds the lease, nobody else can change the database, so cached pages are served without a request. Commits update the cache.
+- **Replica:** each read sends the cached copy's XXH3-64 checksum; the server answers `checksum_matched` instead of sending bytes it already has.
+
+Every cached page is checked against its checksum before use, so a damaged cache costs a request, never a wrong answer. The cache starts empty each time a database opens.
+
+## Writing a server
+
+You are writing a remote block device with leases. [`proto/grpsqlite.proto`](proto/grpsqlite.proto) is the contract; [`crates/memory`](crates/memory/src/lib.rs) is the reference implementation, and its `Store` is what the simulator tests.
+
+- **Keys.** SQLite writes the main file in whole pages at page-aligned offsets, so key pages by `offset / page_size`. Reads can be shorter or start mid-page (the 100-byte header, the change counter at offset 24); serve them from the page that contains them.
+- **Missing data.** Return the bytes that exist; the client zero-fills the rest.
+- **Leases.** Check the lease inside the same transaction that applies a write or commit. Return `FAILED_PRECONDITION` for a missing, expired or replaced lease.
+- **Versions.** With point-in-time reads, return a version with every read and read at the version a request carries. Versions are opaque bytes: a timestamp, a commit hash, a log offset.
+- **Message size.** A `Commit` holds a whole transaction, and a `VACUUM` rewrites the whole database. Raise your gRPC server's message limit above the default 4 MiB.
+- **Latency.** Each request is a small round trip; disable Nagle's algorithm on accepted connections.
+
+## Testing
+
+```bash
+cargo test --workspace                               # unit, repro, end-to-end and seed tests
+cargo run --release -p grpsqlite-sim --bin vopr -- --seeds 10000
+cargo run --release -p grpsqlite-sim --bin vopr -- 42 --verbose   # replay one seed
+scripts/mutants                                      # planted bugs the seeds must catch
+scripts/build-sqlite && scripts/smoke                # the SQLite shell against the memory server
+```
+
+The VOPR (`crates/sim/src/vopr.rs`) runs SQLite, the VFS and the reference server's `Store` on one thread in simulated time, so a seed replays exactly. Each seed draws a server (atomic or not, with or without point-in-time reads), a page size, journal mode, cache, and fault rates, then runs random transactions, savepoints, rollbacks, `VACUUM`, reopens, replicas, crashes at any request, and lease takeovers. It checks every answer against a model of the committed rows. `crates/sim/tests/repro.rs` replays the bugs this design fixed.
 
 ## Contributing
 
-Do not submit pull requests out of nowhere, they will be closed.
+Do not submit pull requests out of nowhere; they will be closed.
 
-If you find a bug or want to request a feature, create a discussion. Contributors will turn it into an issue if required.
+If you find a bug or want to request a feature, open a discussion. Contributors will turn it into an issue if needed.

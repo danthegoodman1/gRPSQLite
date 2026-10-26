@@ -576,8 +576,10 @@ impl Service {
         self
     }
 
+    /// A Commit carries a whole transaction, so the server accepts messages
+    /// of any size instead of gRPC's default 4 MiB.
     pub fn into_server(self) -> proto::grpsqlite_server::GrpsqliteServer<Service> {
-        proto::grpsqlite_server::GrpsqliteServer::new(self)
+        proto::grpsqlite_server::GrpsqliteServer::new(self).max_decoding_message_size(usize::MAX)
     }
 
     async fn call<T>(
@@ -665,14 +667,16 @@ impl proto::grpsqlite_server::Grpsqlite for Service {
     }
 }
 
-/// Serves `store` on `listener` until the future is dropped.
+/// Serves `service` on `listener` until the future is dropped. Every request
+/// is one small round trip, so connections disable Nagle's algorithm.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     service: Service,
 ) -> Result<(), tonic::transport::Error> {
+    let incoming = tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
     tonic::transport::Server::builder()
         .add_service(service.into_server())
-        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+        .serve_with_incoming(incoming)
         .await
 }
 

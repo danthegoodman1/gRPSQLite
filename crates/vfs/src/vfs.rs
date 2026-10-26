@@ -769,9 +769,13 @@ impl Core {
 
     /// Sends the handle's transaction as one atomic commit.
     pub fn sync(&self, handle: &mut Handle) -> VfsResult<()> {
-        let Handle::Main(f) = handle else {
-            return Ok(());
-        };
+        match handle {
+            Handle::Main(f) => self.commit(f),
+            _ => Ok(()),
+        }
+    }
+
+    fn commit(&self, f: &mut MainFile) -> VfsResult<()> {
         if f.txn.is_empty() {
             return Ok(());
         }

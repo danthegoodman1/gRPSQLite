@@ -41,7 +41,9 @@ service Grpsqlite {
 
   // Commit applies a whole SQLite transaction to the main database file
   // atomically: either every write and the truncation take effect, or none
-  // does. Only servers with atomic_commit receive Commit.
+  // does. Only servers with atomic_commit receive Commit. A request holds the
+  // entire transaction (a VACUUM rewrites the whole database), so raise the
+  // server's message size limit above gRPC's default of 4 MiB.
   rpc Commit(CommitRequest) returns (CommitResponse);
 
   // GetFileSize returns the file's size, or 0 for a missing file.

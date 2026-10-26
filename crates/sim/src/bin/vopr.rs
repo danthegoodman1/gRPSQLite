@@ -36,6 +36,8 @@ fn main() {
             }
         }
     }
+    // Picking the first seed is the one place the runner reads the clock.
+    #[allow(clippy::disallowed_types)]
     let first = seed.unwrap_or_else(|| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

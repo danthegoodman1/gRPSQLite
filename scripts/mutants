@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Plants known bugs in a scratch copy of the repository and checks that VOPR
+seeds catch each one.
+
+Usage: scripts/mutants [--seeds N] [--first SEED] [NAME...]
+
+Each mutant replaces text in one file. A mutant counts as caught when the
+VOPR fails on some seed in the range; the report names the first such seed.
+"""
+
+import argparse
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VFS = "crates/vfs/src/vfs.rs"
+CACHE = "crates/vfs/src/cache.rs"
+
+# (name, guarantee, file, text, replacement)
+MUTANTS = [
+    (
+        "commit-every-write",
+        "G1: a transaction reaches the server whole or not at all",
+        VFS,
+        "            f.txn.write(offset, data);\n            return Ok(());",
+        "            f.txn.write(offset, data);\n            return self.commit(f);",
+    ),
+    (
+        "journal-exists-locally-only",
+        "G1: a crash on a server without atomic commits rolls back from the journal",
+        VFS,
+        "        if db.atomic {\n            return Ok(false);\n        }\n        self.check(&db)?;\n        // Like the unix VFS",
+        "        if true {\n            return Ok(false);\n        }\n        self.check(&db)?;\n        // Like the unix VFS",
+    ),
+    (
+        "stale-state-after-commit",
+        "G1: committed pages replace the cached header and size",
+        VFS,
+        "                for e in &extents {\n                    st.written(e.offset, &e.data);\n                }",
+        "",
+    ),
+    (
+        "failed-commit-reported-ok",
+        "G2: COMMIT succeeds only after the server acknowledges it",
+        VFS,
+        "                Err(self.fail(&f.db, \"commit\", &s, vars::SQLITE_IOERR_WRITE))",
+        "                let _ = self.fail(&f.db, \"commit\", &s, vars::SQLITE_IOERR_WRITE);\n                Ok(())",
+    ),
+    (
+        "lease-loss-ignored",
+        "G3: a client that loses its lease stops using it",
+        VFS,
+        "        if !self.backend.lease_valid(&db.session) {",
+        "        if false {",
+    ),
+    (
+        "replica-reads-latest",
+        "G4: a read-only transaction reads one version",
+        VFS,
+        "                version: f.snapshot.clone(),",
+        "                version: Bytes::new(),",
+    ),
+    (
+        "exclusive-locking-allowed",
+        "G4: writers keep the change counter that replicas rely on",
+        VFS,
+        "        if name == \"locking_mode\"",
+        "        if false && name == \"locking_mode\"",
+    ),
+    (
+        "cache-skips-checksum",
+        "G6: a damaged cache never changes an answer",
+        CACHE,
+        "            Some(data) if data.len() == buf.len() && xxh3_64(&data) == checksum => {",
+        "            Some(data) if data.len() == buf.len() => {",
+    ),
+]
+
+
+def copy_tree(dst: pathlib.Path) -> None:
+    def ignore(directory, names):
+        return [n for n in names if n in ("target", ".git")]
+
+    shutil.copytree(ROOT, dst, ignore=ignore, dirs_exist_ok=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seeds", type=int, default=300)
+    parser.add_argument("--first", type=int, default=0)
+    parser.add_argument("names", nargs="*")
+    args = parser.parse_args()
+
+    selected = [m for m in MUTANTS if not args.names or m[0] in args.names]
+    target = ROOT / "target" / "mutants"
+    missed = []
+    with tempfile.TemporaryDirectory(prefix="grpsqlite-mutants-") as scratch:
+        work = pathlib.Path(scratch) / "repo"
+        for name, guarantee, rel, text, replacement in selected:
+            if work.exists():
+                shutil.rmtree(work)
+            copy_tree(work)
+            path = work / rel
+            source = path.read_text()
+            occurrences = source.count(text)
+            if occurrences == 0:
+                print(f"{name}: text not found in {rel}; update the mutant")
+                missed.append(name)
+                continue
+            path.write_text(source.replace(text, replacement))
+            build = subprocess.run(
+                ["cargo", "build", "--release", "-q", "-p", "grpsqlite-sim", "--bin", "vopr"],
+                cwd=work,
+                env={**__import__("os").environ, "CARGO_TARGET_DIR": str(target)},
+                capture_output=True,
+                text=True,
+            )
+            if build.returncode != 0:
+                print(f"{name}: does not compile\n{build.stderr[-2000:]}")
+                missed.append(name)
+                continue
+            run = subprocess.run(
+                [str(target / "release" / "vopr"), str(args.first), "--seeds", str(args.seeds)],
+                capture_output=True,
+                text=True,
+            )
+            failure = next((l for l in run.stderr.splitlines() if l.startswith("FAILED")), None)
+            if run.returncode != 0 and failure:
+                print(f"{name}: caught ({guarantee})\n    {failure}")
+            else:
+                print(f"{name}: MISSED by seeds {args.first}..{args.first + args.seeds} ({guarantee})")
+                missed.append(name)
+    if missed:
+        print(f"missed: {', '.join(missed)}")
+        return 1
+    print(f"all {len(selected)} mutants caught")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -135,42 +135,37 @@ impl SimBackend {
     pub fn advance(&self, ms: u64) {
         let mut st = self.state.lock();
         let target = st.now + ms;
-        let sessions: Vec<String> = st.leases.keys().cloned().collect();
-        for session in sessions {
-            loop {
-                let Some(track) = st.leases.get(&session) else {
-                    break;
-                };
-                if track.lost || track.next_due > target {
-                    break;
-                }
-                let due = track.next_due;
-                let stalled = track.stalled;
-                let req = proto::HeartbeatRequest {
-                    session: session.clone(),
-                    lease: track.lease.clone(),
-                    database: track.database.clone(),
-                };
-                let interval = track.interval;
-                let loss = st.faults.heartbeat_loss;
-                let lost_in_transit =
-                    stalled || st.partitioned || (st.quiet == 0 && st.rng.per_mille(loss));
-                let result = if lost_in_transit {
-                    None
-                } else {
-                    Some(st.store.heartbeat(req, due))
-                };
-                *st.counts.entry("heartbeat".to_string()).or_default() += 1;
-                let Some(track) = st.leases.get_mut(&session) else {
-                    break;
-                };
-                match result {
-                    Some(Ok(_)) => track.last_ok_sent = due,
-                    Some(Err(_)) => track.lost = true,
-                    None => {}
-                }
-                track.next_due = due + interval;
+        // Deliver due heartbeats in time order across sessions.
+        while let Some((due, session)) = st
+            .leases
+            .iter()
+            .filter(|(_, t)| !t.lost && t.next_due <= target)
+            .map(|(s, t)| (t.next_due, s.clone()))
+            .min()
+        {
+            let Some(track) = st.leases.get(&session) else {
+                break;
+            };
+            let req = proto::HeartbeatRequest {
+                session: session.clone(),
+                lease: track.lease.clone(),
+                database: track.database.clone(),
+            };
+            let stalled = track.stalled;
+            let loss = st.faults.heartbeat_loss;
+            let lost_in_transit =
+                stalled || st.partitioned || (st.quiet == 0 && st.rng.per_mille(loss));
+            let result = (!lost_in_transit).then(|| st.store.heartbeat(req, due));
+            *st.counts.entry("heartbeat".to_string()).or_default() += 1;
+            let Some(track) = st.leases.get_mut(&session) else {
+                break;
+            };
+            match result {
+                Some(Ok(_)) => track.last_ok_sent = due,
+                Some(Err(_)) => track.lost = true,
+                None => {}
             }
+            track.next_due = due + track.interval;
         }
         st.now = target;
     }

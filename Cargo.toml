@@ -19,7 +19,6 @@ prost = "0.14"
 rusqlite = { version = "0.41", features = ["bundled"] }
 sqlite-plugin = { version = "0.11", default-features = false }
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
-tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 tonic-prost = "0.14"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }

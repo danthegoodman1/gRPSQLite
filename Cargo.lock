@@ -305,7 +305,6 @@ dependencies = [
  "grpsqlite-proto",
  "parking_lot",
  "tokio",
- "tokio-stream",
  "tonic",
  "xxhash-rust",
 ]
